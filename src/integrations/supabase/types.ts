@@ -14,7 +14,84 @@ export type Database = {
   }
   public: {
     Tables: {
-      [_ in never]: never
+      events: {
+        Row: {
+          city: string | null
+          confidence_score: number | null
+          country: string
+          created_at: string
+          dedup_hash: string | null
+          description: string | null
+          end_date: string | null
+          event_date: string | null
+          event_time: string | null
+          event_type: Database["public"]["Enums"]["event_type"]
+          id: string
+          image_url: string | null
+          is_online: boolean
+          organizer: string | null
+          registration_link: string | null
+          source_platform: string | null
+          source_url: string | null
+          state: string
+          status: Database["public"]["Enums"]["event_status"]
+          tags: string[] | null
+          title: string
+          updated_at: string
+          venue: string | null
+        }
+        Insert: {
+          city?: string | null
+          confidence_score?: number | null
+          country?: string
+          created_at?: string
+          dedup_hash?: string | null
+          description?: string | null
+          end_date?: string | null
+          event_date?: string | null
+          event_time?: string | null
+          event_type?: Database["public"]["Enums"]["event_type"]
+          id?: string
+          image_url?: string | null
+          is_online?: boolean
+          organizer?: string | null
+          registration_link?: string | null
+          source_platform?: string | null
+          source_url?: string | null
+          state: string
+          status?: Database["public"]["Enums"]["event_status"]
+          tags?: string[] | null
+          title: string
+          updated_at?: string
+          venue?: string | null
+        }
+        Update: {
+          city?: string | null
+          confidence_score?: number | null
+          country?: string
+          created_at?: string
+          dedup_hash?: string | null
+          description?: string | null
+          end_date?: string | null
+          event_date?: string | null
+          event_time?: string | null
+          event_type?: Database["public"]["Enums"]["event_type"]
+          id?: string
+          image_url?: string | null
+          is_online?: boolean
+          organizer?: string | null
+          registration_link?: string | null
+          source_platform?: string | null
+          source_url?: string | null
+          state?: string
+          status?: Database["public"]["Enums"]["event_status"]
+          tags?: string[] | null
+          title?: string
+          updated_at?: string
+          venue?: string | null
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never
@@ -23,7 +100,18 @@ export type Database = {
       [_ in never]: never
     }
     Enums: {
-      [_ in never]: never
+      event_status: "upcoming" | "ongoing" | "completed" | "cancelled"
+      event_type:
+        | "meetup"
+        | "hackathon"
+        | "workshop"
+        | "conference"
+        | "ama"
+        | "online_session"
+        | "bootcamp"
+        | "summit"
+        | "webinar"
+        | "other"
     }
     CompositeTypes: {
       [_ in never]: never
@@ -150,6 +238,20 @@ export type CompositeTypes<
 
 export const Constants = {
   public: {
-    Enums: {},
+    Enums: {
+      event_status: ["upcoming", "ongoing", "completed", "cancelled"],
+      event_type: [
+        "meetup",
+        "hackathon",
+        "workshop",
+        "conference",
+        "ama",
+        "online_session",
+        "bootcamp",
+        "summit",
+        "webinar",
+        "other",
+      ],
+    },
   },
 } as const
