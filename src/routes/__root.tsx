@@ -1,5 +1,6 @@
 import { Outlet, Link, createRootRoute, HeadContent, Scripts } from "@tanstack/react-router";
 import { Toaster } from "sonner";
+import { Navbar } from "@/components/Navbar";
 
 import appCss from "../styles.css?url";
 
@@ -32,14 +33,13 @@ export const Route = createRootRoute({
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "Lovable App" },
-      { name: "description", content: "Lovable Generated Project" },
-      { name: "author", content: "Lovable" },
-      { property: "og:title", content: "Lovable App" },
-      { property: "og:description", content: "Lovable Generated Project" },
+      { title: "NextChain Radar — Nigeria's Web3 Event Intelligence" },
+      { name: "description", content: "Discover every Web3, crypto, and blockchain event across Nigeria's 36 states." },
+      { name: "author", content: "NextChain Radar" },
+      { property: "og:title", content: "NextChain Radar" },
+      { property: "og:description", content: "Nigeria's Web3 Event Intelligence Engine" },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary" },
-      { name: "twitter:site", content: "@Lovable" },
     ],
     links: [
       {
@@ -70,6 +70,7 @@ function RootShell({ children }: { children: React.ReactNode }) {
 function RootComponent() {
   return (
     <>
+      <Navbar />
       <Outlet />
       <Toaster position="top-right" richColors />
     </>
