@@ -1,14 +1,14 @@
 import { Link, useLocation } from "@tanstack/react-router";
 import logo from "@/assets/logo.png";
 
-const navLinks = [
-  { to: "/", label: "Dashboard" },
-  { to: "/events", label: "Events" },
-  { to: "/admin", label: "Admin" },
-] as const;
-
 export function Navbar() {
   const location = useLocation();
+
+  const navLinks = [
+    { to: "/" as const, label: "Dashboard" },
+    { to: "/events" as const, label: "Events" },
+    { to: "/admin" as const, label: "Admin" },
+  ];
 
   return (
     <nav className="sticky top-0 z-50 border-b border-border bg-background/80 backdrop-blur-xl">
@@ -22,7 +22,7 @@ export function Navbar() {
 
         <div className="flex items-center gap-1">
           {navLinks.map((link) => {
-            const isActive = location.pathname === link.to || 
+            const isActive = location.pathname === link.to ||
               (link.to !== "/" && location.pathname.startsWith(link.to));
             return (
               <Link
