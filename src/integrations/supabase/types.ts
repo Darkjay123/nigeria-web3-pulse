@@ -92,6 +92,107 @@ export type Database = {
         }
         Relationships: []
       }
+      scrape_logs: {
+        Row: {
+          created_at: string
+          duplicates_skipped: number
+          errors: string | null
+          events_found: number
+          events_inserted: number
+          id: string
+          source: string
+        }
+        Insert: {
+          created_at?: string
+          duplicates_skipped?: number
+          errors?: string | null
+          events_found?: number
+          events_inserted?: number
+          id?: string
+          source: string
+        }
+        Update: {
+          created_at?: string
+          duplicates_skipped?: number
+          errors?: string | null
+          events_found?: number
+          events_inserted?: number
+          id?: string
+          source?: string
+        }
+        Relationships: []
+      }
+      telegram_bot_state: {
+        Row: {
+          id: number
+          update_offset: number
+          updated_at: string
+        }
+        Insert: {
+          id: number
+          update_offset?: number
+          updated_at?: string
+        }
+        Update: {
+          id?: number
+          update_offset?: number
+          updated_at?: string
+        }
+        Relationships: []
+      }
+      telegram_messages: {
+        Row: {
+          chat_id: number
+          created_at: string
+          raw_update: Json
+          text: string | null
+          update_id: number
+        }
+        Insert: {
+          chat_id: number
+          created_at?: string
+          raw_update: Json
+          text?: string | null
+          update_id: number
+        }
+        Update: {
+          chat_id?: number
+          created_at?: string
+          raw_update?: Json
+          text?: string | null
+          update_id?: number
+        }
+        Relationships: []
+      }
+      telegram_posted_events: {
+        Row: {
+          event_id: string
+          id: string
+          message_id: number | null
+          posted_at: string
+        }
+        Insert: {
+          event_id: string
+          id?: string
+          message_id?: number | null
+          posted_at?: string
+        }
+        Update: {
+          event_id?: string
+          id?: string
+          message_id?: number | null
+          posted_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "telegram_posted_events_event_id_fkey"
+            columns: ["event_id"]
+            isOneToOne: true
+            referencedRelation: "events"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
     }
     Views: {
       [_ in never]: never
