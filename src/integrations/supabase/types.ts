@@ -30,11 +30,13 @@ export type Database = {
           image_url: string | null
           is_online: boolean
           organizer: string | null
+          popularity_score: number | null
           registration_link: string | null
           source_platform: string | null
           source_url: string | null
           state: string
           status: Database["public"]["Enums"]["event_status"]
+          submission_count: number
           tags: string[] | null
           title: string
           updated_at: string
@@ -55,11 +57,13 @@ export type Database = {
           image_url?: string | null
           is_online?: boolean
           organizer?: string | null
+          popularity_score?: number | null
           registration_link?: string | null
           source_platform?: string | null
           source_url?: string | null
           state: string
           status?: Database["public"]["Enums"]["event_status"]
+          submission_count?: number
           tags?: string[] | null
           title: string
           updated_at?: string
@@ -80,11 +84,13 @@ export type Database = {
           image_url?: string | null
           is_online?: boolean
           organizer?: string | null
+          popularity_score?: number | null
           registration_link?: string | null
           source_platform?: string | null
           source_url?: string | null
           state?: string
           status?: Database["public"]["Enums"]["event_status"]
+          submission_count?: number
           tags?: string[] | null
           title?: string
           updated_at?: string
@@ -192,6 +198,45 @@ export type Database = {
             referencedColumns: ["id"]
           },
         ]
+      }
+      user_submitted_events: {
+        Row: {
+          created_at: string
+          dedup_hash: string | null
+          id: string
+          link: string | null
+          normalized_date: string | null
+          normalized_title: string | null
+          processed: boolean
+          raw_text: string | null
+          submission_count: number
+          submitted_by: string[] | null
+        }
+        Insert: {
+          created_at?: string
+          dedup_hash?: string | null
+          id?: string
+          link?: string | null
+          normalized_date?: string | null
+          normalized_title?: string | null
+          processed?: boolean
+          raw_text?: string | null
+          submission_count?: number
+          submitted_by?: string[] | null
+        }
+        Update: {
+          created_at?: string
+          dedup_hash?: string | null
+          id?: string
+          link?: string | null
+          normalized_date?: string | null
+          normalized_title?: string | null
+          processed?: boolean
+          raw_text?: string | null
+          submission_count?: number
+          submitted_by?: string[] | null
+        }
+        Relationships: []
       }
     }
     Views: {
