@@ -43,6 +43,112 @@ const EVENT_TYPE_KEYWORDS: Record<string, string[]> = {
   "webinar": ["webinar"],
 };
 
+// ============ WEB3 KEYWORD PRE-FILTER ============
+
+const WEB3_KEYWORDS = [
+  "web3", "blockchain", "crypto", "cryptocurrency", "defi", "nft", "dao",
+  "smart contract", "ethereum", "bitcoin", "layer 2", "layer2", "l2",
+  "zk", "zero knowledge", "rollup", "token", "tokenomics", "wallet",
+  "onchain", "on-chain", "stablecoin", "solidity", "dapp", "dapps",
+  "decentralized", "decentralised", "consensus", "mining", "staking",
+  "yield", "liquidity", "amm", "dex", "cefi", "metaverse", "gamefi",
+  "play to earn", "move to earn", "soulbound", "airdrop", "ido", "ico",
+  "launchpad", "bridge", "cross-chain", "crosschain", "multichain",
+  "polygon", "solana", "bnb chain", "avalanche", "arbitrum", "optimism",
+  "base chain", "sui", "aptos", "cosmos", "polkadot", "near protocol",
+  "chainlink", "uniswap", "opensea", "metamask", "ledger",
+];
+
+function web3KeywordScore(text: string): number {
+  const lower = text.toLowerCase();
+  let score = 0;
+  for (const kw of WEB3_KEYWORDS) {
+    if (lower.includes(kw)) score++;
+  }
+  return score;
+}
+
+// ============ AI CLASSIFICATION ============
+
+const AI_GATEWAY_URL = "https://ai.gateway.lovable.dev/v1/chat/completions";
+
+interface AIClassification {
+  relevant: boolean;
+  event_type: string;
+  tags: string[];
+  state: string;
+  city: string | null;
+  event_date: string | null;
+  confidence_score: number;
+}
+
+async function classifyWithAI(
+  event: { title: string; description?: string; venue?: string; city?: string },
+  apiKey: string
+): Promise<AIClassification | null> {
+  const prompt = `You are a strict Web3 event classifier. Analyze this event and determine if it is genuinely about Web3/blockchain/crypto.
+
+EVENT:
+Title: ${event.title}
+Description: ${(event.description || "").substring(0, 800)}
+Venue: ${event.venue || "N/A"}
+City: ${event.city || "N/A"}
+
+RULES:
+- ONLY mark relevant=true if Web3/blockchain/crypto is the CORE focus
+- Reject generic tech events (AI, SaaS, design, product) unless Web3 is central
+- Reject events with weak/passing crypto mentions
+- Accept niche deep Web3 topics (ZK, MEV, account abstraction, etc.)
+
+Respond with a JSON object using this exact structure:
+{
+  "relevant": boolean,
+  "event_type": "meetup"|"hackathon"|"workshop"|"conference"|"ama"|"online_session"|"bootcamp"|"summit"|"webinar"|"other",
+  "tags": string[] (from: defi, nft, dao, zk, layer2, trading, security, identity, gaming, ai+crypto, stablecoin, regulation, smart_contracts, infrastructure, community, education),
+  "state": string (Nigerian state name or "Online"),
+  "city": string or null,
+  "event_date": "YYYY-MM-DD" or null,
+  "confidence_score": number 0.0-1.0
+}`;
+
+  try {
+    const resp = await fetch(AI_GATEWAY_URL, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "google/gemini-2.5-flash-lite",
+        messages: [
+          { role: "system", content: "You are a strict Web3 event classifier. Output ONLY valid JSON, no markdown." },
+          { role: "user", content: prompt },
+        ],
+        temperature: 0.1,
+      }),
+    });
+
+    if (!resp.ok) {
+      console.error(`[AI] Classification failed: ${resp.status}`);
+      return null;
+    }
+
+    const data = await resp.json();
+    const content = data.choices?.[0]?.message?.content?.trim();
+    if (!content) return null;
+
+    // Strip markdown code fences if present
+    const jsonStr = content.replace(/^```json?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
+    const parsed = JSON.parse(jsonStr);
+    return parsed as AIClassification;
+  } catch (e) {
+    console.error('[AI] Classification error:', e);
+    return null;
+  }
+}
+
+// ============ UTILITY FUNCTIONS ============
+
 function detectState(text: string): string {
   const lower = text.toLowerCase();
   if (lower.includes("online") || lower.includes("virtual") || lower.includes("remote")) return "Online";
@@ -90,11 +196,6 @@ function extractDate(text: string): string | null {
   return null;
 }
 
-function extractLinks(text: string): string[] {
-  const urlPattern = /https?:\/\/[^\s<>"{}|\\^`\[\]]+/g;
-  return text.match(urlPattern) || [];
-}
-
 function computeConfidence(event: any): number {
   let score = 0.2;
   if (event.title) score += 0.15;
@@ -132,18 +233,13 @@ async function scrapeLumaEvents(): Promise<any[]> {
       console.log(`[Luma] Status for "${query}": ${resp.status}`);
 
       if (!resp.ok) {
-        // HTML fallback
         const htmlResp = await fetch(`https://lu.ma/discover?query=${query}`);
         if (htmlResp.ok) {
           const html = await htmlResp.text();
-          console.log(`[Luma] HTML fallback length for "${query}": ${html.length}`);
-          // Try to extract event titles from HTML
           const titleMatches = html.matchAll(/<h[1-3][^>]*>([^<]{10,100})<\/h[1-3]>/gi);
           for (const m of titleMatches) {
             const title = m[1].trim();
-            if (title.length > 10) {
-              events.push({ title, source_platform: "luma" });
-            }
+            if (title.length > 10) events.push({ title, source_platform: "luma" });
           }
         }
         continue;
@@ -192,15 +288,11 @@ async function scrapeEventbriteEvents(): Promise<any[]> {
         }
       });
 
-      if (!resp.ok) {
-        console.log(`[Eventbrite] Status ${resp.status} for "${query}"`);
-        continue;
-      }
+      if (!resp.ok) { console.log(`[Eventbrite] Status ${resp.status} for "${query}"`); continue; }
 
       const html = await resp.text();
       console.log(`[Eventbrite] HTML length for "${query}": ${html.length}`);
 
-      // Extract JSON-LD structured data
       const jsonLdMatches = html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g);
       let jsonLdCount = 0;
       for (const m of jsonLdMatches) {
@@ -229,17 +321,7 @@ async function scrapeEventbriteEvents(): Promise<any[]> {
         } catch { /* skip invalid JSON-LD */ }
       }
 
-      // HTML fallback if no JSON-LD events found
       if (jsonLdCount === 0) {
-        console.log(`[Eventbrite] No JSON-LD found for "${query}", trying HTML fallback`);
-        const titleMatches = html.matchAll(/data-testid="[^"]*event[^"]*"[^>]*>([^<]+)</gi);
-        for (const m of titleMatches) {
-          const title = m[1].trim();
-          if (title.length > 10) {
-            events.push({ title, source_platform: "eventbrite" });
-          }
-        }
-        // Also try og:title extraction
         const linkMatches = html.matchAll(/href="(https:\/\/www\.eventbrite\.com\/e\/[^"]+)"/g);
         for (const m of linkMatches) {
           const slug = m[1].split('/e/')[1]?.replace(/-tickets-\d+$/, '')?.replace(/-/g, ' ');
@@ -253,7 +335,6 @@ async function scrapeEventbriteEvents(): Promise<any[]> {
           }
         }
       }
-      console.log(`[Eventbrite] Extracted ${jsonLdCount} JSON-LD events for "${query}"`);
     } catch (e) {
       console.error(`[Eventbrite] Error for "${query}":`, e);
     }
@@ -279,14 +360,9 @@ async function scrapeMeetupEvents(): Promise<any[]> {
         }
       });
 
-      if (!resp.ok) {
-        console.log(`[Meetup] Status ${resp.status}`);
-        continue;
-      }
+      if (!resp.ok) { console.log(`[Meetup] Status ${resp.status}`); continue; }
 
       const html = await resp.text();
-      console.log(`[Meetup] HTML length: ${html.length}`);
-
       const jsonLdMatches = html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g);
       for (const m of jsonLdMatches) {
         try {
@@ -324,12 +400,13 @@ Deno.serve(async (req) => {
   try {
     const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
     const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+    const lovableApiKey = Deno.env.get('LOVABLE_API_KEY')!;
     const supabase = createClient(supabaseUrl, supabaseKey);
 
     const results = {
-      luma: { found: 0, inserted: 0, duplicates: 0, errors: '' },
-      eventbrite: { found: 0, inserted: 0, duplicates: 0, errors: '' },
-      meetup: { found: 0, inserted: 0, duplicates: 0, errors: '' },
+      luma: { found: 0, inserted: 0, duplicates: 0, filtered_keyword: 0, filtered_ai: 0, errors: '' },
+      eventbrite: { found: 0, inserted: 0, duplicates: 0, filtered_keyword: 0, filtered_ai: 0, errors: '' },
+      meetup: { found: 0, inserted: 0, duplicates: 0, filtered_keyword: 0, filtered_ai: 0, errors: '' },
     };
 
     const [lumaEvents, eventbriteEvents, meetupEvents] = await Promise.all([
@@ -350,25 +427,51 @@ Deno.serve(async (req) => {
 
     console.log(`Scraped totals: Luma=${lumaEvents.length}, Eventbrite=${eventbriteEvents.length}, Meetup=${meetupEvents.length}`);
 
+    // Process events with hybrid filtering: keyword pre-filter → AI classification
     for (const raw of allRaw) {
       try {
+        if (!raw.title || raw.title.length < 5) continue;
+
         const fullText = `${raw.title || ''} ${raw.description || ''} ${raw.venue || ''} ${raw.city || ''}`;
-        const state = raw.state || detectState(fullText);
-        const eventType = raw.event_type || detectEventType(fullText);
-        const isOnline = raw.is_online ?? detectIsOnline(fullText);
-        const eventDate = raw.event_date || extractDate(fullText);
 
-        console.log(`RAW EVENT: "${raw.title}" [${raw._source}] → state=${state}, type=${eventType}`);
-
-        if (!raw.title || raw.title.length < 5) {
-          console.log(`SKIP: Title too short: "${raw.title}"`);
+        // ── STAGE 1: Keyword pre-filter (fast, no API call) ──
+        const kwScore = web3KeywordScore(fullText);
+        if (kwScore < 2) {
+          results[raw._source].filtered_keyword++;
+          console.log(`[KEYWORD REJECT] "${raw.title}" (score=${kwScore})`);
           continue;
         }
+        console.log(`[KEYWORD PASS] "${raw.title}" (score=${kwScore})`);
 
-        // RELAXED FILTER: accept all events (test mode)
-        const nigeriaRelated = true;
+        // ── STAGE 2: AI classification (strict relevance check) ──
+        let aiResult: AIClassification | null = null;
+        if (lovableApiKey) {
+          aiResult = await classifyWithAI(
+            { title: raw.title, description: raw.description, venue: raw.venue, city: raw.city },
+            lovableApiKey
+          );
+        }
 
-        const dedupHash = await generateDedupHash(raw.title, eventDate, state);
+        if (aiResult) {
+          if (!aiResult.relevant || aiResult.confidence_score < 0.5) {
+            results[raw._source].filtered_ai++;
+            console.log(`[AI REJECT] "${raw.title}" (relevant=${aiResult.relevant}, confidence=${aiResult.confidence_score})`);
+            continue;
+          }
+          console.log(`[AI ACCEPT] "${raw.title}" (confidence=${aiResult.confidence_score}, type=${aiResult.event_type}, tags=${aiResult.tags.join(',')})`);
+        }
+
+        // ── Build event record using AI enrichment + fallbacks ──
+        const state = aiResult?.state || raw.state || detectState(fullText);
+        const eventType = aiResult?.event_type || raw.event_type || detectEventType(fullText);
+        const isOnline = state === "Online" || raw.is_online || detectIsOnline(fullText);
+        const eventDate = aiResult?.event_date || raw.event_date || extractDate(fullText);
+        const city = aiResult?.city || raw.city || null;
+        const tags = aiResult?.tags || [];
+        const confidenceScore = aiResult?.confidence_score || computeConfidence({ ...raw, state, event_date: eventDate });
+
+        const resolvedState = state === "Unknown" ? (isOnline ? "Online" : "Lagos") : state;
+        const dedupHash = await generateDedupHash(raw.title, eventDate, resolvedState);
 
         const { data: existing } = await supabase
           .from('events')
@@ -381,11 +484,13 @@ Deno.serve(async (req) => {
           continue;
         }
 
-        const eventRecord = {
+        const popularityScore = (0 * 0.4) + (confidenceScore * 0.6);
+
+        const { error } = await supabase.from('events').insert({
           title: raw.title.substring(0, 500),
           description: raw.description?.substring(0, 2000) || null,
-          city: raw.city || null,
-          state: state === "Unknown" ? (isOnline ? "Online" : "Lagos") : state,
+          city,
+          state: resolvedState,
           country: "Nigeria",
           venue: raw.venue || null,
           event_date: eventDate,
@@ -395,27 +500,23 @@ Deno.serve(async (req) => {
           registration_link: raw.registration_link || null,
           source_url: raw.source_url || null,
           event_type: eventType,
-          tags: [],
+          tags,
           is_online: isOnline,
-          confidence_score: 0,
+          confidence_score: confidenceScore,
           dedup_hash: dedupHash,
           status: 'upcoming' as const,
           source_platform: raw.source_platform || null,
           image_url: null,
           submission_count: 0,
-          popularity_score: 0,
-        };
+          popularity_score: popularityScore,
+        });
 
-        eventRecord.confidence_score = computeConfidence(eventRecord);
-        eventRecord.popularity_score = eventRecord.confidence_score * 0.6;
-
-        const { error } = await supabase.from('events').insert(eventRecord);
         if (error) {
           console.error('Insert error:', error.message);
           results[raw._source].errors += `Insert: ${error.message}; `;
         } else {
           results[raw._source].inserted++;
-          console.log(`INSERTED: "${raw.title}"`);
+          console.log(`INSERTED: "${raw.title}" [${eventType}] confidence=${confidenceScore}`);
         }
       } catch (e) {
         console.error('Process event error:', e);
@@ -443,6 +544,8 @@ Deno.serve(async (req) => {
 
     const totalInserted = Object.values(results).reduce((s, r) => s + r.inserted, 0);
     const totalFound = Object.values(results).reduce((s, r) => s + r.found, 0);
+    const totalKeywordFiltered = Object.values(results).reduce((s, r) => s + r.filtered_keyword, 0);
+    const totalAIFiltered = Object.values(results).reduce((s, r) => s + r.filtered_ai, 0);
 
     // FAILSAFE: If no events inserted, add a system check event
     if (totalInserted === 0 && totalFound === 0) {
@@ -470,7 +573,6 @@ Deno.serve(async (req) => {
           submission_count: 0,
           popularity_score: 0.12,
         });
-        console.log('FAILSAFE: System check event inserted.');
       }
     }
 
@@ -490,7 +592,6 @@ Deno.serve(async (req) => {
           sub.normalized_title, sub.normalized_date, 'Unknown'
         );
 
-        // Check if event already exists
         const { data: existing } = await supabase
           .from('events')
           .select('id, submission_count')
@@ -498,14 +599,12 @@ Deno.serve(async (req) => {
           .maybeSingle();
 
         if (existing) {
-          // Boost existing event
           const newCount = (existing.submission_count || 0) + sub.submission_count;
           const popularityScore = (newCount * 0.4) + (0.5 * 0.6);
           await supabase.from('events')
             .update({ submission_count: newCount, popularity_score: popularityScore })
             .eq('id', existing.id);
         } else {
-          // Insert new event from submission
           const fullText = `${sub.normalized_title} ${sub.raw_text || ''} ${sub.link || ''}`;
           await supabase.from('events').insert({
             title: sub.normalized_title.substring(0, 500),
@@ -532,7 +631,7 @@ Deno.serve(async (req) => {
       }
     }
 
-    console.log(`Pipeline complete. Inserted ${totalInserted} scraped, processed ${submissionsProcessed} submissions.`);
+    console.log(`Pipeline complete. Found=${totalFound}, KeywordFiltered=${totalKeywordFiltered}, AIFiltered=${totalAIFiltered}, Inserted=${totalInserted}, Submissions=${submissionsProcessed}`);
 
     return new Response(JSON.stringify({
       ok: true,
@@ -540,6 +639,8 @@ Deno.serve(async (req) => {
       submissions: { processed: submissionsProcessed },
       total_events: totalFound,
       total_inserted: totalInserted,
+      total_keyword_filtered: totalKeywordFiltered,
+      total_ai_filtered: totalAIFiltered,
     }), {
       headers: { 'Content-Type': 'application/json' },
     });
