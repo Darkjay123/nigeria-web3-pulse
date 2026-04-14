@@ -33,7 +33,16 @@ async function sendTelegramMessage(chatId: number, text: string): Promise<void> 
   }
 }
 
-async function handleCommand(command: string, args: string, chatId: number, supabase: any): Promise<void> {
+async function generateDedupHash(title: string, date: string | null, state: string): Promise<string> {
+  const raw = `${title.toLowerCase().trim()}|${date || ''}|${state}`;
+  const encoder = new TextEncoder();
+  const data = encoder.encode(raw);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('').substring(0, 32);
+}
+
+async function handleCommand(command: string, args: string, chatId: number, username: string, supabase: any): Promise<void> {
   const today = new Date().toISOString().split('T')[0];
 
   switch (command) {
@@ -43,6 +52,7 @@ async function handleCommand(command: string, args: string, chatId: number, supa
         .select('*')
         .eq('status', 'upcoming')
         .gte('event_date', today)
+        .order('popularity_score', { ascending: false })
         .order('event_date', { ascending: true })
         .limit(10);
 
@@ -54,7 +64,9 @@ async function handleCommand(command: string, args: string, chatId: number, supa
       let msg = `📋 <b>Next 10 Upcoming Web3 Events</b>\n\n`;
       for (const ev of events) {
         const loc = ev.is_online ? '🌐 Online' : `📍 ${ev.state}`;
-        msg += `• <b>${escapeHtml(ev.title)}</b>\n  📅 ${ev.event_date} | ${loc}\n`;
+        msg += `• <b>${escapeHtml(ev.title)}</b>\n  📅 ${ev.event_date} | ${loc}`;
+        if (ev.submission_count > 0) msg += ` | 🔥 ${ev.submission_count}`;
+        msg += `\n`;
         if (ev.registration_link) msg += `  🔗 ${ev.registration_link}\n`;
         msg += `\n`;
       }
@@ -142,6 +154,64 @@ async function handleCommand(command: string, args: string, chatId: number, supa
       break;
     }
 
+    case '/submit': {
+      const link = args.trim();
+      if (!link) {
+        await sendTelegramMessage(chatId, '⚠️ Please provide a link.\n\nExample: /submit https://lu.ma/my-event');
+        return;
+      }
+
+      // Extract title from link (basic)
+      let normalizedTitle = link;
+      try {
+        const url = new URL(link);
+        const pathParts = url.pathname.split('/').filter(Boolean);
+        normalizedTitle = pathParts[pathParts.length - 1]?.replace(/[-_]/g, ' ') || link;
+        normalizedTitle = normalizedTitle.charAt(0).toUpperCase() + normalizedTitle.slice(1);
+      } catch {
+        normalizedTitle = link.substring(0, 100);
+      }
+
+      const hash = await generateDedupHash(normalizedTitle, null, 'Unknown');
+
+      // Check for existing submission
+      const { data: existing } = await supabase
+        .from('user_submitted_events')
+        .select('id, submission_count, submitted_by')
+        .eq('dedup_hash', hash)
+        .maybeSingle();
+
+      if (existing) {
+        // Increment submission count
+        const newBy = [...(existing.submitted_by || []), username].slice(-20);
+        await supabase.from('user_submitted_events')
+          .update({
+            submission_count: existing.submission_count + 1,
+            submitted_by: newBy,
+          })
+          .eq('id', existing.id);
+
+        await sendTelegramMessage(chatId,
+          `✅ This event has already been submitted! Your vote has been counted.\n🔥 Now submitted by ${existing.submission_count + 1} people.`
+        );
+      } else {
+        await supabase.from('user_submitted_events').insert({
+          link,
+          raw_text: args,
+          normalized_title: normalizedTitle,
+          dedup_hash: hash,
+          submission_count: 1,
+          submitted_by: [username],
+          processed: false,
+        });
+
+        await sendTelegramMessage(chatId,
+          `✅ Event submitted! It will be reviewed and added to NextChain Radar.\n\n📌 <b>${escapeHtml(normalizedTitle)}</b>\n🔗 ${escapeHtml(link)}`
+        );
+      }
+      break;
+    }
+
     case '/start':
     case '/help': {
       const msg = `🤖 <b>NextChain Radar Bot</b>\n\n` +
@@ -150,6 +220,7 @@ async function handleCommand(command: string, args: string, chatId: number, supa
         `/today — Today's events\n` +
         `/state &lt;name&gt; — Events in a specific state\n` +
         `/online — Online events only\n` +
+        `/submit &lt;link&gt; — Submit an event\n` +
         `/help — Show this message\n\n` +
         `<i>Powered by NextChain Radar 🇳🇬</i>`;
       await sendTelegramMessage(chatId, msg);
@@ -177,7 +248,6 @@ Deno.serve(async () => {
 
   let totalProcessed = 0;
 
-  // Read initial offset
   const { data: state, error: stateErr } = await supabase
     .from('telegram_bot_state')
     .select('update_offset')
@@ -193,7 +263,6 @@ Deno.serve(async () => {
   while (true) {
     const elapsed = Date.now() - startTime;
     const remainingMs = MAX_RUNTIME_MS - elapsed;
-
     if (remainingMs < MIN_REMAINING_MS) break;
 
     const timeout = Math.min(50, Math.floor(remainingMs / 1000) - 5);
@@ -221,7 +290,6 @@ Deno.serve(async () => {
     const updates = data.result ?? [];
     if (updates.length === 0) continue;
 
-    // Store messages
     const rows = updates
       .filter((u: any) => u.message)
       .map((u: any) => ({
@@ -237,13 +305,13 @@ Deno.serve(async () => {
         .upsert(rows, { onConflict: 'update_id' });
     }
 
-    // Process commands
     for (const update of updates) {
       if (update.message?.text?.startsWith('/')) {
         const parts = update.message.text.split(' ');
-        const command = parts[0].split('@')[0]; // Remove @botname
+        const command = parts[0].split('@')[0];
         const args = parts.slice(1).join(' ');
-        await handleCommand(command, args, update.message.chat.id, supabase);
+        const username = update.message.from?.username || update.message.from?.first_name || 'anonymous';
+        await handleCommand(command, args, update.message.chat.id, username, supabase);
       }
     }
 
