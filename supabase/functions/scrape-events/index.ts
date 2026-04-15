@@ -299,10 +299,7 @@ async function scrapeWithFirecrawl(firecrawlApiKey: string): Promise<any[]> {
 async function scrapeLumaEvents(): Promise<any[]> {
   const events: any[] = [];
   const queries = [
-    "web3+nigeria", "blockchain+nigeria", "crypto+nigeria", "defi+nigeria",
-    "web3+africa", "blockchain+lagos", "web3+meetup", "crypto+africa",
-    "web3+lagos", "blockchain+africa", "nft+nigeria", "dao+nigeria",
-    "web3+abuja", "defi+africa", "ethereum+nigeria", "solana+nigeria",
+    "web3+nigeria", "blockchain+lagos", "crypto+nigeria", "web3+africa",
   ];
 
   for (const query of queries) {
