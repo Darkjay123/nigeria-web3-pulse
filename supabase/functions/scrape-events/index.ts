@@ -137,7 +137,6 @@ Respond with a JSON object using this exact structure:
     const content = data.choices?.[0]?.message?.content?.trim();
     if (!content) return null;
 
-    // Strip markdown code fences if present
     const jsonStr = content.replace(/^```json?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
     const parsed = JSON.parse(jsonStr);
     return parsed as AIClassification;
@@ -216,13 +215,100 @@ async function generateDedupHash(title: string, date: string | null, state: stri
   return hashArray.map(b => b.toString(16).padStart(2, '0')).join('').substring(0, 32);
 }
 
-// ============ SCRAPERS ============
+// ============ FIRECRAWL SEARCH SCRAPER ============
+
+const FIRECRAWL_API_URL = "https://api.firecrawl.dev/v1";
+
+async function scrapeWithFirecrawl(firecrawlApiKey: string): Promise<any[]> {
+  const events: any[] = [];
+  const searchQueries = [
+    "web3 events Nigeria 2025",
+    "blockchain meetup Lagos",
+    "crypto conference Africa 2025",
+    "defi workshop Abuja",
+    "web3 hackathon Nigeria",
+    "blockchain summit Africa",
+    "NFT event Lagos",
+    "crypto meetup Nigeria",
+    "web3 conference Lagos 2025",
+    "blockchain bootcamp Africa",
+  ];
+
+  for (const query of searchQueries) {
+    try {
+      console.log(`[Firecrawl] Searching: "${query}"`);
+      const resp = await fetch(`${FIRECRAWL_API_URL}/search`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${firecrawlApiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          query,
+          limit: 10,
+          scrapeOptions: { formats: ["markdown"] },
+        }),
+      });
+
+      if (!resp.ok) {
+        console.error(`[Firecrawl] Search failed for "${query}": ${resp.status}`);
+        continue;
+      }
+
+      const data = await resp.json();
+      const results = data.data || [];
+      console.log(`[Firecrawl] Found ${results.length} results for "${query}"`);
+
+      for (const result of results) {
+        const markdown = result.markdown || "";
+        const title = result.title || result.metadata?.title || "";
+        const url = result.url || "";
+        const description = result.description || markdown.substring(0, 500);
+
+        if (!title || title.length < 10) continue;
+
+        events.push({
+          title,
+          description,
+          source_url: url,
+          registration_link: url,
+          source_platform: "firecrawl",
+          venue: null,
+          city: null,
+          event_date: null,
+          event_time: null,
+          end_date: null,
+          organizer: null,
+          is_online: false,
+        });
+      }
+
+      // Rate limit: small delay between searches
+      await new Promise(r => setTimeout(r, 500));
+    } catch (e) {
+      console.error(`[Firecrawl] Error for "${query}":`, e);
+    }
+  }
+
+  // Deduplicate by title similarity
+  const seen = new Set<string>();
+  return events.filter(e => {
+    const key = e.title.toLowerCase().substring(0, 50);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+// ============ PLATFORM SCRAPERS ============
 
 async function scrapeLumaEvents(): Promise<any[]> {
   const events: any[] = [];
   const queries = [
     "web3+nigeria", "blockchain+nigeria", "crypto+nigeria", "defi+nigeria",
-    "web3+africa", "blockchain+lagos", "web3+meetup", "crypto+africa"
+    "web3+africa", "blockchain+lagos", "web3+meetup", "crypto+africa",
+    "web3+lagos", "blockchain+africa", "nft+nigeria", "dao+nigeria",
+    "web3+abuja", "defi+africa", "ethereum+nigeria", "solana+nigeria",
   ];
 
   for (const query of queries) {
@@ -394,6 +480,159 @@ async function scrapeMeetupEvents(): Promise<any[]> {
   return events;
 }
 
+// ============ ENRICHMENT: Scrape a submitted link for full event data ============
+
+async function enrichSubmittedLink(link: string, firecrawlApiKey: string): Promise<any | null> {
+  try {
+    console.log(`[Enrich] Scraping submitted link: ${link}`);
+    const resp = await fetch(`${FIRECRAWL_API_URL}/scrape`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${firecrawlApiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        url: link,
+        formats: ["markdown"],
+      }),
+    });
+
+    if (!resp.ok) {
+      console.error(`[Enrich] Firecrawl scrape failed: ${resp.status}`);
+      return null;
+    }
+
+    const data = await resp.json();
+    const result = data.data || data;
+    const markdown = result.markdown || "";
+    const title = result.metadata?.title || "";
+    const description = result.metadata?.description || markdown.substring(0, 1000);
+
+    if (!title || title.length < 5) return null;
+
+    return {
+      title,
+      description,
+      source_url: link,
+      registration_link: link,
+      source_platform: "community",
+      venue: null,
+      city: null,
+      event_date: null,
+      event_time: null,
+      end_date: null,
+      organizer: null,
+      is_online: false,
+      _raw_markdown: markdown,
+    };
+  } catch (e) {
+    console.error('[Enrich] Error:', e);
+    return null;
+  }
+}
+
+// ============ HYBRID FILTER PIPELINE ============
+
+async function processEvent(
+  raw: any,
+  sourceName: string,
+  supabase: any,
+  lovableApiKey: string,
+  stats: any
+): Promise<boolean> {
+  if (!raw.title || raw.title.length < 5) return false;
+
+  const fullText = `${raw.title || ''} ${raw.description || ''} ${raw.venue || ''} ${raw.city || ''}`;
+
+  // STAGE 1: Keyword pre-filter
+  const kwScore = web3KeywordScore(fullText);
+  if (kwScore < 2) {
+    stats.filtered_keyword++;
+    console.log(`[KEYWORD REJECT] "${raw.title}" (score=${kwScore})`);
+    return false;
+  }
+  console.log(`[KEYWORD PASS] "${raw.title}" (score=${kwScore})`);
+
+  // STAGE 2: AI classification
+  let aiResult: AIClassification | null = null;
+  if (lovableApiKey) {
+    aiResult = await classifyWithAI(
+      { title: raw.title, description: raw.description, venue: raw.venue, city: raw.city },
+      lovableApiKey
+    );
+  }
+
+  if (aiResult) {
+    if (!aiResult.relevant || aiResult.confidence_score < 0.5) {
+      stats.filtered_ai++;
+      console.log(`[AI REJECT] "${raw.title}" (relevant=${aiResult.relevant}, confidence=${aiResult.confidence_score})`);
+      return false;
+    }
+    console.log(`[AI ACCEPT] "${raw.title}" (confidence=${aiResult.confidence_score}, type=${aiResult.event_type})`);
+  }
+
+  // Build event record
+  const state = aiResult?.state || detectState(fullText);
+  const eventType = aiResult?.event_type || detectEventType(fullText);
+  const isOnline = state === "Online" || raw.is_online || detectIsOnline(fullText);
+  const eventDate = aiResult?.event_date || raw.event_date || extractDate(fullText);
+  const city = aiResult?.city || raw.city || null;
+  const tags = aiResult?.tags || [];
+  const confidenceScore = aiResult?.confidence_score || computeConfidence({ ...raw, state, event_date: eventDate });
+
+  const resolvedState = state === "Unknown" ? (isOnline ? "Online" : "Lagos") : state;
+  const dedupHash = await generateDedupHash(raw.title, eventDate, resolvedState);
+
+  const { data: existing } = await supabase
+    .from('events')
+    .select('id')
+    .eq('dedup_hash', dedupHash)
+    .maybeSingle();
+
+  if (existing) {
+    stats.duplicates++;
+    return false;
+  }
+
+  const submissionCount = raw._submission_count || 0;
+  const popularityScore = (submissionCount * 0.4) + (confidenceScore * 0.6);
+
+  const { error } = await supabase.from('events').insert({
+    title: raw.title.substring(0, 500),
+    description: raw.description?.substring(0, 2000) || null,
+    city,
+    state: resolvedState,
+    country: "Nigeria",
+    venue: raw.venue || null,
+    event_date: eventDate,
+    event_time: raw.event_time || null,
+    end_date: raw.end_date || null,
+    organizer: raw.organizer || null,
+    registration_link: raw.registration_link || null,
+    source_url: raw.source_url || null,
+    event_type: eventType,
+    tags,
+    is_online: isOnline,
+    confidence_score: confidenceScore,
+    dedup_hash: dedupHash,
+    status: 'upcoming' as const,
+    source_platform: raw.source_platform || sourceName,
+    image_url: null,
+    submission_count: submissionCount,
+    popularity_score: popularityScore,
+  });
+
+  if (error) {
+    console.error('Insert error:', error.message);
+    stats.errors += `Insert: ${error.message}; `;
+    return false;
+  }
+
+  stats.inserted++;
+  console.log(`INSERTED: "${raw.title}" [${eventType}] confidence=${confidenceScore}`);
+  return true;
+}
+
 // ============ MAIN HANDLER ============
 
 Deno.serve(async (req) => {
@@ -401,123 +640,49 @@ Deno.serve(async (req) => {
     const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
     const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
     const lovableApiKey = Deno.env.get('LOVABLE_API_KEY')!;
+    const firecrawlApiKey = Deno.env.get('FIRECRAWL_API_KEY') || '';
     const supabase = createClient(supabaseUrl, supabaseKey);
 
-    const results = {
+    const results: Record<string, any> = {
       luma: { found: 0, inserted: 0, duplicates: 0, filtered_keyword: 0, filtered_ai: 0, errors: '' },
       eventbrite: { found: 0, inserted: 0, duplicates: 0, filtered_keyword: 0, filtered_ai: 0, errors: '' },
       meetup: { found: 0, inserted: 0, duplicates: 0, filtered_keyword: 0, filtered_ai: 0, errors: '' },
+      firecrawl: { found: 0, inserted: 0, duplicates: 0, filtered_keyword: 0, filtered_ai: 0, errors: '' },
     };
 
-    const [lumaEvents, eventbriteEvents, meetupEvents] = await Promise.all([
+    // Scrape all sources in parallel
+    const scrapePromises: Promise<any[]>[] = [
       scrapeLumaEvents().catch(e => { results.luma.errors = String(e); return []; }),
       scrapeEventbriteEvents().catch(e => { results.eventbrite.errors = String(e); return []; }),
       scrapeMeetupEvents().catch(e => { results.meetup.errors = String(e); return []; }),
-    ]);
+    ];
+
+    if (firecrawlApiKey) {
+      scrapePromises.push(
+        scrapeWithFirecrawl(firecrawlApiKey).catch(e => { results.firecrawl.errors = String(e); return []; })
+      );
+    }
+
+    const [lumaEvents, eventbriteEvents, meetupEvents, firecrawlEvents = []] = await Promise.all(scrapePromises);
 
     const allRaw = [
       ...lumaEvents.map(e => ({ ...e, _source: 'luma' as const })),
       ...eventbriteEvents.map(e => ({ ...e, _source: 'eventbrite' as const })),
       ...meetupEvents.map(e => ({ ...e, _source: 'meetup' as const })),
+      ...firecrawlEvents.map(e => ({ ...e, _source: 'firecrawl' as const })),
     ];
 
     results.luma.found = lumaEvents.length;
     results.eventbrite.found = eventbriteEvents.length;
     results.meetup.found = meetupEvents.length;
+    results.firecrawl.found = firecrawlEvents.length;
 
-    console.log(`Scraped totals: Luma=${lumaEvents.length}, Eventbrite=${eventbriteEvents.length}, Meetup=${meetupEvents.length}`);
+    console.log(`Scraped totals: Luma=${lumaEvents.length}, Eventbrite=${eventbriteEvents.length}, Meetup=${meetupEvents.length}, Firecrawl=${firecrawlEvents.length}`);
 
-    // Process events with hybrid filtering: keyword pre-filter → AI classification
+    // Process events through hybrid filter pipeline
     for (const raw of allRaw) {
       try {
-        if (!raw.title || raw.title.length < 5) continue;
-
-        const fullText = `${raw.title || ''} ${raw.description || ''} ${raw.venue || ''} ${raw.city || ''}`;
-
-        // ── STAGE 1: Keyword pre-filter (fast, no API call) ──
-        const kwScore = web3KeywordScore(fullText);
-        if (kwScore < 2) {
-          results[raw._source].filtered_keyword++;
-          console.log(`[KEYWORD REJECT] "${raw.title}" (score=${kwScore})`);
-          continue;
-        }
-        console.log(`[KEYWORD PASS] "${raw.title}" (score=${kwScore})`);
-
-        // ── STAGE 2: AI classification (strict relevance check) ──
-        let aiResult: AIClassification | null = null;
-        if (lovableApiKey) {
-          aiResult = await classifyWithAI(
-            { title: raw.title, description: raw.description, venue: raw.venue, city: raw.city },
-            lovableApiKey
-          );
-        }
-
-        if (aiResult) {
-          if (!aiResult.relevant || aiResult.confidence_score < 0.5) {
-            results[raw._source].filtered_ai++;
-            console.log(`[AI REJECT] "${raw.title}" (relevant=${aiResult.relevant}, confidence=${aiResult.confidence_score})`);
-            continue;
-          }
-          console.log(`[AI ACCEPT] "${raw.title}" (confidence=${aiResult.confidence_score}, type=${aiResult.event_type}, tags=${aiResult.tags.join(',')})`);
-        }
-
-        // ── Build event record using AI enrichment + fallbacks ──
-        const state = aiResult?.state || raw.state || detectState(fullText);
-        const eventType = aiResult?.event_type || raw.event_type || detectEventType(fullText);
-        const isOnline = state === "Online" || raw.is_online || detectIsOnline(fullText);
-        const eventDate = aiResult?.event_date || raw.event_date || extractDate(fullText);
-        const city = aiResult?.city || raw.city || null;
-        const tags = aiResult?.tags || [];
-        const confidenceScore = aiResult?.confidence_score || computeConfidence({ ...raw, state, event_date: eventDate });
-
-        const resolvedState = state === "Unknown" ? (isOnline ? "Online" : "Lagos") : state;
-        const dedupHash = await generateDedupHash(raw.title, eventDate, resolvedState);
-
-        const { data: existing } = await supabase
-          .from('events')
-          .select('id')
-          .eq('dedup_hash', dedupHash)
-          .maybeSingle();
-
-        if (existing) {
-          results[raw._source].duplicates++;
-          continue;
-        }
-
-        const popularityScore = (0 * 0.4) + (confidenceScore * 0.6);
-
-        const { error } = await supabase.from('events').insert({
-          title: raw.title.substring(0, 500),
-          description: raw.description?.substring(0, 2000) || null,
-          city,
-          state: resolvedState,
-          country: "Nigeria",
-          venue: raw.venue || null,
-          event_date: eventDate,
-          event_time: raw.event_time || null,
-          end_date: raw.end_date || null,
-          organizer: raw.organizer || null,
-          registration_link: raw.registration_link || null,
-          source_url: raw.source_url || null,
-          event_type: eventType,
-          tags,
-          is_online: isOnline,
-          confidence_score: confidenceScore,
-          dedup_hash: dedupHash,
-          status: 'upcoming' as const,
-          source_platform: raw.source_platform || null,
-          image_url: null,
-          submission_count: 0,
-          popularity_score: popularityScore,
-        });
-
-        if (error) {
-          console.error('Insert error:', error.message);
-          results[raw._source].errors += `Insert: ${error.message}; `;
-        } else {
-          results[raw._source].inserted++;
-          console.log(`INSERTED: "${raw.title}" [${eventType}] confidence=${confidenceScore}`);
-        }
+        await processEvent(raw, raw._source, supabase, lovableApiKey, results[raw._source]);
       } catch (e) {
         console.error('Process event error:', e);
         results[raw._source].errors += String(e) + '; ';
@@ -542,12 +707,12 @@ Deno.serve(async (req) => {
       .lt('event_date', new Date().toISOString().split('T')[0])
       .eq('status', 'upcoming');
 
-    const totalInserted = Object.values(results).reduce((s, r) => s + r.inserted, 0);
-    const totalFound = Object.values(results).reduce((s, r) => s + r.found, 0);
-    const totalKeywordFiltered = Object.values(results).reduce((s, r) => s + r.filtered_keyword, 0);
-    const totalAIFiltered = Object.values(results).reduce((s, r) => s + r.filtered_ai, 0);
+    const totalInserted = Object.values(results).reduce((s: number, r: any) => s + r.inserted, 0);
+    const totalFound = Object.values(results).reduce((s: number, r: any) => s + r.found, 0);
+    const totalKeywordFiltered = Object.values(results).reduce((s: number, r: any) => s + r.filtered_keyword, 0);
+    const totalAIFiltered = Object.values(results).reduce((s: number, r: any) => s + r.filtered_ai, 0);
 
-    // FAILSAFE: If no events inserted, add a system check event
+    // FAILSAFE
     if (totalInserted === 0 && totalFound === 0) {
       console.log('FAILSAFE: No events found. Inserting system check event.');
       const today = new Date().toISOString().split('T')[0];
@@ -576,7 +741,7 @@ Deno.serve(async (req) => {
       }
     }
 
-    // Process unprocessed user submissions into events
+    // Process unprocessed user submissions with FULL enrichment
     const { data: submissions } = await supabase
       .from('user_submitted_events')
       .select('*')
@@ -584,44 +749,37 @@ Deno.serve(async (req) => {
       .limit(20);
 
     let submissionsProcessed = 0;
+    let submissionsAccepted = 0;
     if (submissions && submissions.length > 0) {
       for (const sub of submissions) {
-        if (!sub.normalized_title || sub.normalized_title.length < 5) continue;
+        // Try to enrich the link with Firecrawl
+        let enrichedEvent: any = null;
+        if (sub.link && firecrawlApiKey) {
+          enrichedEvent = await enrichSubmittedLink(sub.link, firecrawlApiKey);
+        }
 
-        const hash = sub.dedup_hash || await generateDedupHash(
-          sub.normalized_title, sub.normalized_date, 'Unknown'
-        );
+        if (enrichedEvent) {
+          // Run enriched event through the full hybrid pipeline
+          enrichedEvent._submission_count = sub.submission_count;
+          const subStats = { inserted: 0, filtered_keyword: 0, filtered_ai: 0, duplicates: 0, errors: '' };
+          const accepted = await processEvent(enrichedEvent, 'community', supabase, lovableApiKey, subStats);
+          if (accepted) submissionsAccepted++;
+        } else if (sub.normalized_title && sub.normalized_title.length >= 5) {
+          // Fallback: insert with basic data if no enrichment possible
+          const hash = sub.dedup_hash || await generateDedupHash(sub.normalized_title, sub.normalized_date, 'Unknown');
+          const { data: existing } = await supabase
+            .from('events')
+            .select('id, submission_count')
+            .eq('dedup_hash', hash)
+            .maybeSingle();
 
-        const { data: existing } = await supabase
-          .from('events')
-          .select('id, submission_count')
-          .eq('dedup_hash', hash)
-          .maybeSingle();
-
-        if (existing) {
-          const newCount = (existing.submission_count || 0) + sub.submission_count;
-          const popularityScore = (newCount * 0.4) + (0.5 * 0.6);
-          await supabase.from('events')
-            .update({ submission_count: newCount, popularity_score: popularityScore })
-            .eq('id', existing.id);
-        } else {
-          const fullText = `${sub.normalized_title} ${sub.raw_text || ''} ${sub.link || ''}`;
-          await supabase.from('events').insert({
-            title: sub.normalized_title.substring(0, 500),
-            description: sub.raw_text?.substring(0, 2000) || null,
-            state: detectState(fullText) || 'Unknown',
-            event_date: sub.normalized_date || null,
-            registration_link: sub.link || null,
-            source_url: sub.link || null,
-            source_platform: 'community',
-            event_type: detectEventType(fullText),
-            is_online: detectIsOnline(fullText),
-            dedup_hash: hash,
-            status: 'upcoming',
-            confidence_score: 0.4,
-            submission_count: sub.submission_count,
-            popularity_score: (sub.submission_count * 0.4) + (0.4 * 0.6),
-          });
+          if (existing) {
+            const newCount = (existing.submission_count || 0) + sub.submission_count;
+            const popularityScore = (newCount * 0.4) + (0.5 * 0.6);
+            await supabase.from('events')
+              .update({ submission_count: newCount, popularity_score: popularityScore })
+              .eq('id', existing.id);
+          }
         }
 
         await supabase.from('user_submitted_events')
@@ -631,12 +789,12 @@ Deno.serve(async (req) => {
       }
     }
 
-    console.log(`Pipeline complete. Found=${totalFound}, KeywordFiltered=${totalKeywordFiltered}, AIFiltered=${totalAIFiltered}, Inserted=${totalInserted}, Submissions=${submissionsProcessed}`);
+    console.log(`Pipeline complete. Found=${totalFound}, KeywordFiltered=${totalKeywordFiltered}, AIFiltered=${totalAIFiltered}, Inserted=${totalInserted}, Submissions=${submissionsProcessed}, SubAccepted=${submissionsAccepted}`);
 
     return new Response(JSON.stringify({
       ok: true,
       scrape_results: results,
-      submissions: { processed: submissionsProcessed },
+      submissions: { processed: submissionsProcessed, accepted: submissionsAccepted },
       total_events: totalFound,
       total_inserted: totalInserted,
       total_keyword_filtered: totalKeywordFiltered,
