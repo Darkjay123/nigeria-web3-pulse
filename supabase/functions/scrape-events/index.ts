@@ -222,16 +222,10 @@ const FIRECRAWL_API_URL = "https://api.firecrawl.dev/v1";
 async function scrapeWithFirecrawl(firecrawlApiKey: string): Promise<any[]> {
   const events: any[] = [];
   const searchQueries = [
-    "web3 events Nigeria 2025",
-    "blockchain meetup Lagos",
-    "crypto conference Africa 2025",
-    "defi workshop Abuja",
+    "web3 events Nigeria 2026",
+    "blockchain meetup Lagos 2026",
+    "crypto conference Africa 2026",
     "web3 hackathon Nigeria",
-    "blockchain summit Africa",
-    "NFT event Lagos",
-    "crypto meetup Nigeria",
-    "web3 conference Lagos 2025",
-    "blockchain bootcamp Africa",
   ];
 
   for (const query of searchQueries) {
