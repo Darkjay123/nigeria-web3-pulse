@@ -33,6 +33,21 @@ async function sendTelegramMessage(chatId: number, text: string): Promise<void> 
   }
 }
 
+function formatEventList(events: any[], title: string, showDate = true): string {
+  if (!events || events.length === 0) return '';
+  let msg = `${title}\n\n`;
+  for (const ev of events) {
+    const loc = ev.is_online ? '🌐 Online' : `📍 ${[ev.city, ev.state].filter(Boolean).join(', ') || ev.state}`;
+    msg += `• <b>${escapeHtml(ev.title)}</b>\n`;
+    if (showDate) msg += `  📅 ${ev.event_date || 'TBA'} `;
+    msg += `  🕐 ${ev.event_time || 'TBA'} | ${loc}\n`;
+    if (ev.submission_count > 0) msg += `  🔥 ${ev.submission_count} submissions\n`;
+    if (ev.registration_link) msg += `  🔗 ${ev.registration_link}\n`;
+    msg += `\n`;
+  }
+  return msg;
+}
+
 async function generateDedupHash(title: string, date: string | null, state: string): Promise<string> {
   const raw = `${title.toLowerCase().trim()}|${date || ''}|${state}`;
   const encoder = new TextEncoder();
@@ -47,28 +62,55 @@ async function handleCommand(command: string, args: string, chatId: number, user
 
   switch (command) {
     case '/events': {
-      const { data: events } = await supabase
+      // Support sub-commands: /events today, /events week, /events month
+      const sub = args.trim().toLowerCase();
+
+      let query = supabase
         .from('events')
         .select('*')
-        .eq('status', 'upcoming')
-        .gte('event_date', today)
+        .eq('status', 'upcoming');
+
+      if (sub === 'today') {
+        query = query.eq('event_date', today);
+      } else if (sub === 'week') {
+        const weekEnd = new Date();
+        weekEnd.setDate(weekEnd.getDate() + 7);
+        query = query.gte('event_date', today).lte('event_date', weekEnd.toISOString().split('T')[0]);
+      } else if (sub === 'month') {
+        const monthEnd = new Date();
+        monthEnd.setDate(monthEnd.getDate() + 30);
+        query = query.gte('event_date', today).lte('event_date', monthEnd.toISOString().split('T')[0]);
+      } else {
+        query = query.gte('event_date', today);
+      }
+
+      const { data: events } = await query
         .order('popularity_score', { ascending: false })
         .order('event_date', { ascending: true })
-        .limit(10);
+        .limit(30);
 
       if (!events || events.length === 0) {
         await sendTelegramMessage(chatId, '📭 No upcoming events found.');
         return;
       }
 
-      let msg = `📋 <b>Next 10 Upcoming Web3 Events</b>\n\n`;
+      const label = sub === 'today' ? "Today's" : sub === 'week' ? 'This Week' : sub === 'month' ? 'This Month' : 'Upcoming';
+      let msg = `📋 <b>${label} Web3 Events (${events.length})</b>\n\n`;
+
+      // Paginate: show in chunks, max ~30
       for (const ev of events) {
         const loc = ev.is_online ? '🌐 Online' : `📍 ${ev.state}`;
-        msg += `• <b>${escapeHtml(ev.title)}</b>\n  📅 ${ev.event_date} | ${loc}`;
+        msg += `• <b>${escapeHtml(ev.title)}</b>\n  📅 ${ev.event_date || 'TBA'} | ${loc}`;
         if (ev.submission_count > 0) msg += ` | 🔥 ${ev.submission_count}`;
         msg += `\n`;
         if (ev.registration_link) msg += `  🔗 ${ev.registration_link}\n`;
         msg += `\n`;
+
+        // Telegram message limit ~4096 chars
+        if (msg.length > 3500) {
+          msg += `...and more. Use /events week or /events month for filtered views.`;
+          break;
+        }
       }
       await sendTelegramMessage(chatId, msg);
       break;
@@ -80,7 +122,7 @@ async function handleCommand(command: string, args: string, chatId: number, user
         .select('*')
         .eq('event_date', today)
         .eq('status', 'upcoming')
-        .order('event_time', { ascending: true });
+        .order('popularity_score', { ascending: false });
 
       if (!events || events.length === 0) {
         await sendTelegramMessage(chatId, '📭 No events scheduled for today.');
@@ -112,7 +154,7 @@ async function handleCommand(command: string, args: string, chatId: number, user
         .ilike('state', `%${stateName}%`)
         .gte('event_date', today)
         .order('event_date', { ascending: true })
-        .limit(10);
+        .limit(20);
 
       if (!events || events.length === 0) {
         await sendTelegramMessage(chatId, `📭 No upcoming events found in ${escapeHtml(stateName)}.`);
@@ -137,7 +179,7 @@ async function handleCommand(command: string, args: string, chatId: number, user
         .eq('is_online', true)
         .gte('event_date', today)
         .order('event_date', { ascending: true })
-        .limit(10);
+        .limit(20);
 
       if (!events || events.length === 0) {
         await sendTelegramMessage(chatId, '📭 No upcoming online events found.');
@@ -161,7 +203,6 @@ async function handleCommand(command: string, args: string, chatId: number, user
         return;
       }
 
-      // Extract title from link (basic)
       let normalizedTitle = link;
       try {
         const url = new URL(link);
@@ -174,7 +215,6 @@ async function handleCommand(command: string, args: string, chatId: number, user
 
       const hash = await generateDedupHash(normalizedTitle, null, 'Unknown');
 
-      // Check for existing submission
       const { data: existing } = await supabase
         .from('user_submitted_events')
         .select('id, submission_count, submitted_by')
@@ -182,7 +222,6 @@ async function handleCommand(command: string, args: string, chatId: number, user
         .maybeSingle();
 
       if (existing) {
-        // Increment submission count
         const newBy = [...(existing.submitted_by || []), username].slice(-20);
         await supabase.from('user_submitted_events')
           .update({
@@ -192,7 +231,7 @@ async function handleCommand(command: string, args: string, chatId: number, user
           .eq('id', existing.id);
 
         await sendTelegramMessage(chatId,
-          `✅ This event has already been submitted! Your vote has been counted.\n🔥 Now submitted by ${existing.submission_count + 1} people.`
+          `✅ Already submitted! Your vote counted.\n🔥 Now submitted by ${existing.submission_count + 1} people.`
         );
       } else {
         await supabase.from('user_submitted_events').insert({
@@ -206,7 +245,7 @@ async function handleCommand(command: string, args: string, chatId: number, user
         });
 
         await sendTelegramMessage(chatId,
-          `✅ Event submitted! It will be reviewed and added to NextChain Radar.\n\n📌 <b>${escapeHtml(normalizedTitle)}</b>\n🔗 ${escapeHtml(link)}`
+          `✅ Event submitted for review!\n\n📌 <b>${escapeHtml(normalizedTitle)}</b>\n🔗 ${escapeHtml(link)}\n\n<i>It will be verified by our AI pipeline and added if relevant.</i>`
         );
       }
       break;
@@ -216,7 +255,10 @@ async function handleCommand(command: string, args: string, chatId: number, user
     case '/help': {
       const msg = `🤖 <b>NextChain Radar Bot</b>\n\n` +
         `Available commands:\n\n` +
-        `/events — Next 10 upcoming events\n` +
+        `/events — All upcoming events (up to 30)\n` +
+        `/events today — Today's events\n` +
+        `/events week — This week's events\n` +
+        `/events month — This month's events\n` +
         `/today — Today's events\n` +
         `/state &lt;name&gt; — Events in a specific state\n` +
         `/online — Online events only\n` +

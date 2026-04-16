@@ -36,8 +36,6 @@ async function sendTelegramMessage(chatId: string, text: string): Promise<any> {
   const TELEGRAM_API_KEY = Deno.env.get('TELEGRAM_API_KEY');
   if (!TELEGRAM_API_KEY) throw new Error('TELEGRAM_API_KEY is not configured');
 
-  console.log(`Posting to channel: ${chatId}`);
-
   const response = await fetch(`${GATEWAY_URL}/sendMessage`, {
     method: 'POST',
     headers: {
@@ -60,7 +58,7 @@ async function sendTelegramMessage(chatId: string, text: string): Promise<any> {
   return data;
 }
 
-Deno.serve(async (req) => {
+Deno.serve(async () => {
   try {
     const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
     const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
@@ -70,48 +68,40 @@ Deno.serve(async (req) => {
       return new Response(JSON.stringify({ error: 'TELEGRAM_CHANNEL_ID not set' }), { status: 500 });
     }
 
-    console.log(`Channel ID configured: ${channelId}`);
     const supabase = createClient(supabaseUrl, supabaseKey);
 
-    // Get already posted event IDs
-    const { data: postedRows, error: postedErr } = await supabase
-      .from('telegram_posted_events')
-      .select('event_id');
-
-    if (postedErr) {
-      console.error('Error fetching posted events:', postedErr);
-      return new Response(JSON.stringify({ error: postedErr.message }), { status: 500 });
-    }
-
-    const postedSet = new Set((postedRows || []).map(p => p.event_id));
-    console.log(`Already posted: ${postedSet.size} events`);
-
-    // Get upcoming events, ordered by popularity
+    // STRICT: Only post events that have NOT been posted yet
     const { data: events, error: evError } = await supabase
       .from('events')
       .select('*')
       .eq('status', 'upcoming')
+      .eq('posted_to_telegram', false)
       .order('popularity_score', { ascending: false })
       .order('created_at', { ascending: false })
-      .limit(20);
+      .limit(10);
 
     if (evError) {
       console.error('Query error:', evError);
       return new Response(JSON.stringify({ error: evError.message }), { status: 500 });
     }
 
-    // Filter out already posted
-    const toPost = (events || []).filter(e => !postedSet.has(e.id));
-    console.log(`Events to post: ${toPost.length} (total upcoming: ${events?.length || 0})`);
+    const toPost = events || [];
+    console.log(`Events to post: ${toPost.length}`);
 
     let posted = 0;
     const errors: string[] = [];
 
-    for (const event of toPost.slice(0, 10)) {
+    for (const event of toPost) {
       try {
         const msg = formatEventMessage(event);
         const result = await sendTelegramMessage(channelId, msg);
 
+        // Mark as posted on the event itself — single source of truth
+        await supabase.from('events')
+          .update({ posted_to_telegram: true, posted_at: new Date().toISOString() })
+          .eq('id', event.id);
+
+        // Also track in telegram_posted_events for message_id reference
         await supabase.from('telegram_posted_events').insert({
           event_id: event.id,
           message_id: result.result?.message_id || null,
@@ -120,7 +110,7 @@ Deno.serve(async (req) => {
         posted++;
         console.log(`Posted: "${event.title}" (msg_id: ${result.result?.message_id})`);
 
-        // Rate limit: 1 message per second
+        // Rate limit
         await new Promise(r => setTimeout(r, 1100));
       } catch (e) {
         const errMsg = `Failed to post "${event.title}": ${String(e)}`;
@@ -130,11 +120,7 @@ Deno.serve(async (req) => {
     }
 
     console.log(`Posted ${posted} events to Telegram`);
-    return new Response(JSON.stringify({
-      ok: true,
-      posted,
-      errors: errors.length > 0 ? errors : undefined,
-    }), {
+    return new Response(JSON.stringify({ ok: true, posted, errors: errors.length > 0 ? errors : undefined }), {
       headers: { 'Content-Type': 'application/json' },
     });
   } catch (e) {
