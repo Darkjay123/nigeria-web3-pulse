@@ -1,5 +1,7 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
+// ============ CONSTANTS ============
+
 const NIGERIAN_STATES = [
   "Abia", "Adamawa", "Akwa Ibom", "Anambra", "Bauchi", "Bayelsa", "Benue",
   "Borno", "Cross River", "Delta", "Ebonyi", "Edo", "Ekiti", "Enugu",
@@ -68,6 +70,127 @@ function web3KeywordScore(text: string): number {
   return score;
 }
 
+// ============ PAGE TYPE GATE ============
+
+const ALLOWED_EVENT_DOMAINS = [
+  "eventbrite.com", "lu.ma", "meetup.com", "partiful.com",
+  "pretix.eu", "hopin.com", "luma.com", "events.com",
+  "konfhub.com", "airmeet.com", "guild.host",
+];
+
+const BLOCKED_DOMAINS = [
+  "punchng.com", "medium.com", "blog.", "news.", "techpoint.africa",
+  "disrupt-africa.com", "venturesafrica.com", "nairametrics.com",
+  "guardian.ng", "vanguardngr.com", "thecable.ng", "premiumtimesng.com",
+  "channelstv.com", "bbc.com", "cnn.com", "reuters.com",
+  "wikipedia.org", "youtube.com", "facebook.com", "linkedin.com",
+  "reddit.com", "quora.com", "twitter.com", "x.com",
+];
+
+const LIST_ARTICLE_PHRASES = [
+  "top ", "best ", "list of", "in this article", "here are",
+  "upcoming events in", "about us", "our team", "privacy policy",
+  "terms of service", "cookie policy", "subscribe to", "sign up for our",
+  "read more", "related articles", "you might also like",
+  "table of contents", "written by", "published on",
+  "share this", "comments section",
+];
+
+const EVENT_STRUCTURE_SIGNALS = [
+  "register", "rsvp", "ticket", "attend", "join us",
+  "save your spot", "reserve", "sign up", "get tickets",
+  "free entry", "limited seats", "book now",
+];
+
+function isAllowedDomain(url: string): "allowed" | "blocked" | "unknown" {
+  try {
+    const hostname = new URL(url).hostname.toLowerCase();
+    for (const d of BLOCKED_DOMAINS) {
+      if (hostname.includes(d)) return "blocked";
+    }
+    for (const d of ALLOWED_EVENT_DOMAINS) {
+      if (hostname.includes(d)) return "allowed";
+    }
+    return "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+function isListArticle(text: string): boolean {
+  const lower = text.toLowerCase().substring(0, 500);
+  let matches = 0;
+  for (const phrase of LIST_ARTICLE_PHRASES) {
+    if (lower.includes(phrase)) matches++;
+  }
+  return matches >= 2;
+}
+
+function hasEventStructure(text: string): { pass: boolean; signals: number } {
+  const lower = text.toLowerCase();
+  let signals = 0;
+
+  // Check for date patterns
+  const hasDate = /\d{4}-\d{2}-\d{2}/.test(text) ||
+    /\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/i.test(text) ||
+    /(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}/i.test(text) ||
+    /(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i.test(text);
+  if (hasDate) signals++;
+
+  // Check for time
+  const hasTime = /\d{1,2}:\d{2}\s*(?:am|pm|AM|PM)?/.test(text) ||
+    /\d{1,2}\s*(?:am|pm|AM|PM)/.test(text);
+  if (hasTime) signals++;
+
+  // Check for registration/RSVP language
+  for (const sig of EVENT_STRUCTURE_SIGNALS) {
+    if (lower.includes(sig)) { signals++; break; }
+  }
+
+  // Check for venue/location
+  const hasVenue = /venue|location|address|hall|center|centre|hotel|hub|space/i.test(text);
+  if (hasVenue) signals++;
+
+  return { pass: signals >= 2, signals };
+}
+
+/**
+ * PAGE TYPE GATE: Returns true if the event candidate should proceed to AI.
+ * Returns false (with reason) if it should be rejected.
+ */
+function pageTypeGate(raw: { title: string; description?: string; source_url?: string }): { pass: boolean; reason: string } {
+  const url = raw.source_url || "";
+  const fullText = `${raw.title} ${raw.description || ""}`;
+
+  // A) Domain check
+  const domainStatus = isAllowedDomain(url);
+  if (domainStatus === "blocked") {
+    return { pass: false, reason: `blocked domain: ${url}` };
+  }
+
+  // B) Content rejection — list/article detection
+  if (isListArticle(fullText)) {
+    return { pass: false, reason: "list/article content detected" };
+  }
+
+  // C) For unknown domains, require event structure
+  if (domainStatus === "unknown") {
+    const structure = hasEventStructure(fullText);
+    if (!structure.pass) {
+      return { pass: false, reason: `unknown domain, weak event structure (signals=${structure.signals})` };
+    }
+  }
+
+  // D) Must have SOME date signal (hard reject if no date at all)
+  const hasAnyDate = /\d{4}|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b|(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i.test(fullText);
+  // Only enforce for non-event-platform sources
+  if (domainStatus !== "allowed" && !hasAnyDate) {
+    return { pass: false, reason: "no date signal found" };
+  }
+
+  return { pass: true, reason: "ok" };
+}
+
 // ============ AI CLASSIFICATION ============
 
 const AI_GATEWAY_URL = "https://ai.gateway.lovable.dev/v1/chat/completions";
@@ -98,6 +221,7 @@ RULES:
 - ONLY mark relevant=true if Web3/blockchain/crypto is the CORE focus
 - Reject generic tech events (AI, SaaS, design, product) unless Web3 is central
 - Reject events with weak/passing crypto mentions
+- Reject news articles, blog posts, lists, or non-event pages
 - Accept niche deep Web3 topics (ZK, MEV, account abstraction, etc.)
 
 Respond with a JSON object using this exact structure:
@@ -138,8 +262,7 @@ Respond with a JSON object using this exact structure:
     if (!content) return null;
 
     const jsonStr = content.replace(/^```json?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
-    const parsed = JSON.parse(jsonStr);
-    return parsed as AIClassification;
+    return JSON.parse(jsonStr) as AIClassification;
   } catch (e) {
     console.error('[AI] Classification error:', e);
     return null;
@@ -206,8 +329,33 @@ function computeConfidence(event: any): number {
   return Math.min(score, 1.0);
 }
 
+// ============ IMPROVED DEDUP ============
+
+function normalizeTitle(title: string): string {
+  return title
+    .toLowerCase()
+    .replace(/tickets?/gi, '')
+    .replace(/[-_]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/[^a-z0-9 ]/g, '')
+    .trim();
+}
+
+function titleSimilarity(a: string, b: string): number {
+  const na = normalizeTitle(a);
+  const nb = normalizeTitle(b);
+  if (na === nb) return 1.0;
+  // Simple token overlap similarity
+  const tokensA = new Set(na.split(' ').filter(t => t.length > 2));
+  const tokensB = new Set(nb.split(' ').filter(t => t.length > 2));
+  if (tokensA.size === 0 || tokensB.size === 0) return 0;
+  let overlap = 0;
+  for (const t of tokensA) { if (tokensB.has(t)) overlap++; }
+  return (2 * overlap) / (tokensA.size + tokensB.size);
+}
+
 async function generateDedupHash(title: string, date: string | null, state: string): Promise<string> {
-  const raw = `${title.toLowerCase().trim()}|${date || ''}|${state}`;
+  const raw = `${normalizeTitle(title)}|${date || ''}|${state}`;
   const encoder = new TextEncoder();
   const data = encoder.encode(raw);
   const hashBuffer = await crypto.subtle.digest('SHA-256', data);
@@ -215,83 +363,145 @@ async function generateDedupHash(title: string, date: string | null, state: stri
   return hashArray.map(b => b.toString(16).padStart(2, '0')).join('').substring(0, 32);
 }
 
-// ============ FIRECRAWL SEARCH SCRAPER ============
+async function isDuplicateEvent(
+  title: string, date: string | null, link: string | null,
+  dedupHash: string, supabase: any
+): Promise<boolean> {
+  // Check exact hash
+  const { data: exactMatch } = await supabase
+    .from('events')
+    .select('id, title')
+    .eq('dedup_hash', dedupHash)
+    .maybeSingle();
+  if (exactMatch) return true;
+
+  // Check same registration link
+  if (link) {
+    const { data: linkMatch } = await supabase
+      .from('events')
+      .select('id')
+      .eq('registration_link', link)
+      .maybeSingle();
+    if (linkMatch) return true;
+  }
+
+  // Fuzzy title match: check recent events with same date
+  if (date) {
+    const { data: sameDateEvents } = await supabase
+      .from('events')
+      .select('id, title')
+      .eq('event_date', date)
+      .limit(50);
+
+    if (sameDateEvents) {
+      for (const ev of sameDateEvents) {
+        if (titleSimilarity(title, ev.title) > 0.7) return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+// ============ FIRECRAWL (enrichment only) ============
 
 const FIRECRAWL_API_URL = "https://api.firecrawl.dev/v1";
 
-async function scrapeWithFirecrawl(firecrawlApiKey: string): Promise<any[]> {
-  const events: any[] = [];
-  const searchQueries = [
-    "web3 events Nigeria 2026",
-    "blockchain meetup Lagos 2026",
-    "crypto conference Africa 2026",
-    "web3 hackathon Nigeria",
+async function enrichLink(link: string, firecrawlApiKey: string): Promise<any | null> {
+  try {
+    console.log(`[Enrich] Scraping: ${link}`);
+    const resp = await fetch(`${FIRECRAWL_API_URL}/scrape`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${firecrawlApiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ url: link, formats: ["markdown"] }),
+    });
+
+    if (!resp.ok) {
+      console.error(`[Enrich] Failed: ${resp.status}`);
+      return null;
+    }
+
+    const data = await resp.json();
+    const result = data.data || data;
+    const markdown = result.markdown || "";
+    const title = result.metadata?.title || "";
+    const description = result.metadata?.description || markdown.substring(0, 1000);
+
+    if (!title || title.length < 5) return null;
+
+    return {
+      title,
+      description,
+      source_url: link,
+      registration_link: link,
+      source_platform: "community",
+      venue: null,
+      city: null,
+      event_date: null,
+      event_time: null,
+      end_date: null,
+      organizer: null,
+      is_online: false,
+      _raw_markdown: markdown,
+    };
+  } catch (e) {
+    console.error('[Enrich] Error:', e);
+    return null;
+  }
+}
+
+// ============ X/TWITTER DISCOVERY via Firecrawl search ============
+
+async function discoverFromXTwitter(firecrawlApiKey: string): Promise<string[]> {
+  const links: string[] = [];
+  const queries = [
+    'site:x.com "web3 event Lagos"',
+    'site:x.com "blockchain meetup Nigeria"',
+    'site:x.com "crypto conference Africa"',
+    'site:x.com "web3 hackathon" Nigeria',
   ];
 
-  for (const query of searchQueries) {
+  for (const query of queries) {
     try {
-      console.log(`[Firecrawl] Searching: "${query}"`);
+      console.log(`[X Discovery] Searching: "${query}"`);
       const resp = await fetch(`${FIRECRAWL_API_URL}/search`, {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${firecrawlApiKey}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          query,
-          limit: 10,
-          scrapeOptions: { formats: ["markdown"] },
-        }),
+        body: JSON.stringify({ query, limit: 5 }),
       });
 
       if (!resp.ok) {
-        console.error(`[Firecrawl] Search failed for "${query}": ${resp.status}`);
+        console.error(`[X Discovery] Failed for "${query}": ${resp.status}`);
         continue;
       }
 
       const data = await resp.json();
       const results = data.data || [];
-      console.log(`[Firecrawl] Found ${results.length} results for "${query}"`);
 
-      for (const result of results) {
-        const markdown = result.markdown || "";
-        const title = result.title || result.metadata?.title || "";
-        const url = result.url || "";
-        const description = result.description || markdown.substring(0, 500);
-
-        if (!title || title.length < 10) continue;
-
-        events.push({
-          title,
-          description,
-          source_url: url,
-          registration_link: url,
-          source_platform: "firecrawl",
-          venue: null,
-          city: null,
-          event_date: null,
-          event_time: null,
-          end_date: null,
-          organizer: null,
-          is_online: false,
-        });
+      // Extract links from tweet content
+      for (const r of results) {
+        const text = `${r.markdown || ""} ${r.description || ""}`;
+        // Find Luma, Eventbrite, or other event links
+        const urlMatches = text.matchAll(/https?:\/\/(?:lu\.ma|www\.eventbrite\.com|meetup\.com|partiful\.com)[^\s")<\]]+/g);
+        for (const m of urlMatches) {
+          links.push(m[0]);
+        }
       }
 
-      // Rate limit: small delay between searches
       await new Promise(r => setTimeout(r, 500));
     } catch (e) {
-      console.error(`[Firecrawl] Error for "${query}":`, e);
+      console.error(`[X Discovery] Error:`, e);
     }
   }
 
-  // Deduplicate by title similarity
-  const seen = new Set<string>();
-  return events.filter(e => {
-    const key = e.title.toLowerCase().substring(0, 50);
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+  // Deduplicate links
+  return [...new Set(links)];
 }
 
 // ============ PLATFORM SCRAPERS ============
@@ -300,6 +510,7 @@ async function scrapeLumaEvents(): Promise<any[]> {
   const events: any[] = [];
   const queries = [
     "web3+nigeria", "blockchain+lagos", "crypto+nigeria", "web3+africa",
+    "blockchain+africa", "defi+nigeria", "nft+lagos",
   ];
 
   for (const query of queries) {
@@ -307,7 +518,6 @@ async function scrapeLumaEvents(): Promise<any[]> {
       const url = `https://api.lu.ma/public/v2/event/search?query=${query}&pagination_limit=20`;
       console.log(`[Luma] Fetching: ${url}`);
       const resp = await fetch(url, { headers: { 'Accept': 'application/json' } });
-      console.log(`[Luma] Status for "${query}": ${resp.status}`);
 
       if (!resp.ok) {
         const htmlResp = await fetch(`https://lu.ma/discover?query=${query}`);
@@ -324,7 +534,6 @@ async function scrapeLumaEvents(): Promise<any[]> {
 
       const data = await resp.json();
       const entries = data.entries || data.data || [];
-      console.log(`[Luma] Found ${entries.length} entries for "${query}"`);
 
       for (const entry of entries) {
         const ev = entry.event || entry;
@@ -357,7 +566,6 @@ async function scrapeEventbriteEvents(): Promise<any[]> {
   for (const query of queries) {
     try {
       const url = `https://www.eventbrite.com/d/nigeria/${query}/`;
-      console.log(`[Eventbrite] Fetching: ${url}`);
       const resp = await fetch(url, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -365,20 +573,16 @@ async function scrapeEventbriteEvents(): Promise<any[]> {
         }
       });
 
-      if (!resp.ok) { console.log(`[Eventbrite] Status ${resp.status} for "${query}"`); continue; }
+      if (!resp.ok) continue;
 
       const html = await resp.text();
-      console.log(`[Eventbrite] HTML length for "${query}": ${html.length}`);
-
       const jsonLdMatches = html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g);
-      let jsonLdCount = 0;
       for (const m of jsonLdMatches) {
         try {
           const ld = JSON.parse(m[1]);
           const items = Array.isArray(ld) ? ld : [ld];
           for (const item of items) {
             if (item['@type'] === 'Event') {
-              jsonLdCount++;
               events.push({
                 title: item.name || "",
                 description: (item.description || "").substring(0, 500),
@@ -395,22 +599,7 @@ async function scrapeEventbriteEvents(): Promise<any[]> {
               });
             }
           }
-        } catch { /* skip invalid JSON-LD */ }
-      }
-
-      if (jsonLdCount === 0) {
-        const linkMatches = html.matchAll(/href="(https:\/\/www\.eventbrite\.com\/e\/[^"]+)"/g);
-        for (const m of linkMatches) {
-          const slug = m[1].split('/e/')[1]?.replace(/-tickets-\d+$/, '')?.replace(/-/g, ' ');
-          if (slug && slug.length > 10) {
-            events.push({
-              title: slug.charAt(0).toUpperCase() + slug.slice(1),
-              registration_link: m[1],
-              source_url: m[1],
-              source_platform: "eventbrite",
-            });
-          }
-        }
+        } catch { /* skip */ }
       }
     } catch (e) {
       console.error(`[Eventbrite] Error for "${query}":`, e);
@@ -429,7 +618,6 @@ async function scrapeMeetupEvents(): Promise<any[]> {
 
   for (const url of urls) {
     try {
-      console.log(`[Meetup] Fetching: ${url}`);
       const resp = await fetch(url, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -437,7 +625,7 @@ async function scrapeMeetupEvents(): Promise<any[]> {
         }
       });
 
-      if (!resp.ok) { console.log(`[Meetup] Status ${resp.status}`); continue; }
+      if (!resp.ok) continue;
 
       const html = await resp.text();
       const jsonLdMatches = html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g);
@@ -471,57 +659,6 @@ async function scrapeMeetupEvents(): Promise<any[]> {
   return events;
 }
 
-// ============ ENRICHMENT: Scrape a submitted link for full event data ============
-
-async function enrichSubmittedLink(link: string, firecrawlApiKey: string): Promise<any | null> {
-  try {
-    console.log(`[Enrich] Scraping submitted link: ${link}`);
-    const resp = await fetch(`${FIRECRAWL_API_URL}/scrape`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${firecrawlApiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        url: link,
-        formats: ["markdown"],
-      }),
-    });
-
-    if (!resp.ok) {
-      console.error(`[Enrich] Firecrawl scrape failed: ${resp.status}`);
-      return null;
-    }
-
-    const data = await resp.json();
-    const result = data.data || data;
-    const markdown = result.markdown || "";
-    const title = result.metadata?.title || "";
-    const description = result.metadata?.description || markdown.substring(0, 1000);
-
-    if (!title || title.length < 5) return null;
-
-    return {
-      title,
-      description,
-      source_url: link,
-      registration_link: link,
-      source_platform: "community",
-      venue: null,
-      city: null,
-      event_date: null,
-      event_time: null,
-      end_date: null,
-      organizer: null,
-      is_online: false,
-      _raw_markdown: markdown,
-    };
-  } catch (e) {
-    console.error('[Enrich] Error:', e);
-    return null;
-  }
-}
-
 // ============ HYBRID FILTER PIPELINE ============
 
 async function processEvent(
@@ -535,6 +672,14 @@ async function processEvent(
 
   const fullText = `${raw.title || ''} ${raw.description || ''} ${raw.venue || ''} ${raw.city || ''}`;
 
+  // STAGE 0: Page Type Gate
+  const gate = pageTypeGate(raw);
+  if (!gate.pass) {
+    stats.filtered_gate++;
+    console.log(`[GATE REJECT] "${raw.title}" — ${gate.reason}`);
+    return false;
+  }
+
   // STAGE 1: Keyword pre-filter
   const kwScore = web3KeywordScore(fullText);
   if (kwScore < 2) {
@@ -542,7 +687,6 @@ async function processEvent(
     console.log(`[KEYWORD REJECT] "${raw.title}" (score=${kwScore})`);
     return false;
   }
-  console.log(`[KEYWORD PASS] "${raw.title}" (score=${kwScore})`);
 
   // STAGE 2: AI classification
   let aiResult: AIClassification | null = null;
@@ -559,7 +703,7 @@ async function processEvent(
       console.log(`[AI REJECT] "${raw.title}" (relevant=${aiResult.relevant}, confidence=${aiResult.confidence_score})`);
       return false;
     }
-    console.log(`[AI ACCEPT] "${raw.title}" (confidence=${aiResult.confidence_score}, type=${aiResult.event_type})`);
+    console.log(`[AI ACCEPT] "${raw.title}" (confidence=${aiResult.confidence_score})`);
   }
 
   // Build event record
@@ -574,13 +718,9 @@ async function processEvent(
   const resolvedState = state === "Unknown" ? (isOnline ? "Online" : "Lagos") : state;
   const dedupHash = await generateDedupHash(raw.title, eventDate, resolvedState);
 
-  const { data: existing } = await supabase
-    .from('events')
-    .select('id')
-    .eq('dedup_hash', dedupHash)
-    .maybeSingle();
-
-  if (existing) {
+  // STAGE 3: Improved dedup
+  const isDupe = await isDuplicateEvent(raw.title, eventDate, raw.registration_link, dedupHash, supabase);
+  if (isDupe) {
     stats.duplicates++;
     return false;
   }
@@ -606,11 +746,12 @@ async function processEvent(
     is_online: isOnline,
     confidence_score: confidenceScore,
     dedup_hash: dedupHash,
-    status: 'upcoming' as const,
+    status: 'upcoming',
     source_platform: raw.source_platform || sourceName,
     image_url: null,
     submission_count: submissionCount,
     popularity_score: popularityScore,
+    posted_to_telegram: false,
   });
 
   if (error) {
@@ -626,7 +767,7 @@ async function processEvent(
 
 // ============ MAIN HANDLER ============
 
-Deno.serve(async (req) => {
+Deno.serve(async () => {
   try {
     const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
     const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
@@ -634,46 +775,61 @@ Deno.serve(async (req) => {
     const firecrawlApiKey = Deno.env.get('FIRECRAWL_API_KEY') || '';
     const supabase = createClient(supabaseUrl, supabaseKey);
 
+    const emptyStats = () => ({ found: 0, inserted: 0, duplicates: 0, filtered_keyword: 0, filtered_ai: 0, filtered_gate: 0, errors: '' });
     const results: Record<string, any> = {
-      luma: { found: 0, inserted: 0, duplicates: 0, filtered_keyword: 0, filtered_ai: 0, errors: '' },
-      eventbrite: { found: 0, inserted: 0, duplicates: 0, filtered_keyword: 0, filtered_ai: 0, errors: '' },
-      meetup: { found: 0, inserted: 0, duplicates: 0, filtered_keyword: 0, filtered_ai: 0, errors: '' },
-      firecrawl: { found: 0, inserted: 0, duplicates: 0, filtered_keyword: 0, filtered_ai: 0, errors: '' },
+      luma: emptyStats(),
+      eventbrite: emptyStats(),
+      meetup: emptyStats(),
+      x_discovery: emptyStats(),
     };
 
-    // Scrape all sources in parallel
-    const scrapePromises: Promise<any[]>[] = [
+    // ---- Phase 1: Scrape platforms in parallel ----
+    const [lumaEvents, eventbriteEvents, meetupEvents] = await Promise.all([
       scrapeLumaEvents().catch(e => { results.luma.errors = String(e); return []; }),
       scrapeEventbriteEvents().catch(e => { results.eventbrite.errors = String(e); return []; }),
       scrapeMeetupEvents().catch(e => { results.meetup.errors = String(e); return []; }),
-    ];
-
-    if (firecrawlApiKey) {
-      scrapePromises.push(
-        scrapeWithFirecrawl(firecrawlApiKey).catch(e => { results.firecrawl.errors = String(e); return []; })
-      );
-    }
-
-    const [lumaEvents, eventbriteEvents, meetupEvents, firecrawlEvents = []] = await Promise.all(scrapePromises);
-
-    const allRaw = [
-      ...lumaEvents.map(e => ({ ...e, _source: 'luma' as const })),
-      ...eventbriteEvents.map(e => ({ ...e, _source: 'eventbrite' as const })),
-      ...meetupEvents.map(e => ({ ...e, _source: 'meetup' as const })),
-      ...firecrawlEvents.map(e => ({ ...e, _source: 'firecrawl' as const })),
-    ];
+    ]);
 
     results.luma.found = lumaEvents.length;
     results.eventbrite.found = eventbriteEvents.length;
     results.meetup.found = meetupEvents.length;
-    results.firecrawl.found = firecrawlEvents.length;
 
-    console.log(`Scraped totals: Luma=${lumaEvents.length}, Eventbrite=${eventbriteEvents.length}, Meetup=${meetupEvents.length}, Firecrawl=${firecrawlEvents.length}`);
+    // ---- Phase 1b: X/Twitter discovery → extract event links → enrich with Firecrawl ----
+    let xDiscoveredEvents: any[] = [];
+    if (firecrawlApiKey) {
+      try {
+        const xLinks = await discoverFromXTwitter(firecrawlApiKey);
+        console.log(`[X Discovery] Found ${xLinks.length} event links from tweets`);
+        results.x_discovery.found = xLinks.length;
 
-    // Process events through hybrid filter pipeline
+        for (const link of xLinks.slice(0, 10)) {
+          const enriched = await enrichLink(link, firecrawlApiKey);
+          if (enriched) {
+            enriched.source_platform = "x_discovery";
+            xDiscoveredEvents.push(enriched);
+          }
+        }
+      } catch (e) {
+        results.x_discovery.errors = String(e);
+      }
+    }
+
+    // ---- Phase 2: Process all events through pipeline (max 30 per run) ----
+    const allRaw = [
+      ...lumaEvents.map(e => ({ ...e, _source: 'luma' as const })),
+      ...eventbriteEvents.map(e => ({ ...e, _source: 'eventbrite' as const })),
+      ...meetupEvents.map(e => ({ ...e, _source: 'meetup' as const })),
+      ...xDiscoveredEvents.map(e => ({ ...e, _source: 'x_discovery' as const })),
+    ];
+
+    console.log(`Total raw candidates: ${allRaw.length} (max 30 will be processed)`);
+
+    let processed = 0;
     for (const raw of allRaw) {
+      if (processed >= 30) break; // Cap per run for performance
       try {
         await processEvent(raw, raw._source, supabase, lovableApiKey, results[raw._source]);
+        processed++;
       } catch (e) {
         console.error('Process event error:', e);
         results[raw._source].errors += String(e) + '; ';
@@ -698,79 +854,26 @@ Deno.serve(async (req) => {
       .lt('event_date', new Date().toISOString().split('T')[0])
       .eq('status', 'upcoming');
 
-    const totalInserted = Object.values(results).reduce((s: number, r: any) => s + r.inserted, 0);
-    const totalFound = Object.values(results).reduce((s: number, r: any) => s + r.found, 0);
-    const totalKeywordFiltered = Object.values(results).reduce((s: number, r: any) => s + r.filtered_keyword, 0);
-    const totalAIFiltered = Object.values(results).reduce((s: number, r: any) => s + r.filtered_ai, 0);
-
-    // FAILSAFE
-    if (totalInserted === 0 && totalFound === 0) {
-      console.log('FAILSAFE: No events found. Inserting system check event.');
-      const today = new Date().toISOString().split('T')[0];
-      const hash = await generateDedupHash('Test Web3 Event (System Check)', today, 'Online');
-      const { data: existingCheck } = await supabase
-        .from('events')
-        .select('id')
-        .eq('dedup_hash', hash)
-        .maybeSingle();
-
-      if (!existingCheck) {
-        await supabase.from('events').insert({
-          title: 'Test Web3 Event (System Check)',
-          description: 'Automated system check event to verify pipeline is working.',
-          state: 'Online',
-          is_online: true,
-          event_date: today,
-          source_platform: 'system',
-          event_type: 'other',
-          status: 'upcoming',
-          dedup_hash: hash,
-          confidence_score: 0.2,
-          submission_count: 0,
-          popularity_score: 0.12,
-        });
-      }
-    }
-
-    // Process unprocessed user submissions with FULL enrichment
+    // ---- Process user submissions with enrichment ----
     const { data: submissions } = await supabase
       .from('user_submitted_events')
       .select('*')
       .eq('processed', false)
-      .limit(20);
+      .limit(10);
 
-    let submissionsProcessed = 0;
-    let submissionsAccepted = 0;
-    if (submissions && submissions.length > 0) {
+    let submissionsProcessed = 0, submissionsAccepted = 0;
+    if (submissions && submissions.length > 0 && firecrawlApiKey) {
       for (const sub of submissions) {
-        // Try to enrich the link with Firecrawl
         let enrichedEvent: any = null;
-        if (sub.link && firecrawlApiKey) {
-          enrichedEvent = await enrichSubmittedLink(sub.link, firecrawlApiKey);
+        if (sub.link) {
+          enrichedEvent = await enrichLink(sub.link, firecrawlApiKey);
         }
 
         if (enrichedEvent) {
-          // Run enriched event through the full hybrid pipeline
           enrichedEvent._submission_count = sub.submission_count;
-          const subStats = { inserted: 0, filtered_keyword: 0, filtered_ai: 0, duplicates: 0, errors: '' };
+          const subStats = emptyStats();
           const accepted = await processEvent(enrichedEvent, 'community', supabase, lovableApiKey, subStats);
           if (accepted) submissionsAccepted++;
-        } else if (sub.normalized_title && sub.normalized_title.length >= 5) {
-          // Fallback: insert with basic data if no enrichment possible
-          const hash = sub.dedup_hash || await generateDedupHash(sub.normalized_title, sub.normalized_date, 'Unknown');
-          const { data: existing } = await supabase
-            .from('events')
-            .select('id, submission_count')
-            .eq('dedup_hash', hash)
-            .maybeSingle();
-
-          if (existing) {
-            const newCount = (existing.submission_count || 0) + sub.submission_count;
-            const popularityScore = (newCount * 0.4) + (0.5 * 0.6);
-            await supabase.from('events')
-              .update({ submission_count: newCount, popularity_score: popularityScore })
-              .eq('id', existing.id);
-          }
         }
 
         await supabase.from('user_submitted_events')
@@ -780,16 +883,22 @@ Deno.serve(async (req) => {
       }
     }
 
-    console.log(`Pipeline complete. Found=${totalFound}, KeywordFiltered=${totalKeywordFiltered}, AIFiltered=${totalAIFiltered}, Inserted=${totalInserted}, Submissions=${submissionsProcessed}, SubAccepted=${submissionsAccepted}`);
+    // FAILSAFE
+    const totalInserted = Object.values(results).reduce((s: number, r: any) => s + r.inserted, 0);
+    const totalFound = Object.values(results).reduce((s: number, r: any) => s + r.found, 0);
+
+    if (totalInserted === 0 && totalFound === 0) {
+      console.log('FAILSAFE: No events found anywhere.');
+    }
+
+    console.log(`Pipeline complete. Found=${totalFound}, Inserted=${totalInserted}`);
 
     return new Response(JSON.stringify({
       ok: true,
       scrape_results: results,
       submissions: { processed: submissionsProcessed, accepted: submissionsAccepted },
-      total_events: totalFound,
+      total_found: totalFound,
       total_inserted: totalInserted,
-      total_keyword_filtered: totalKeywordFiltered,
-      total_ai_filtered: totalAIFiltered,
     }), {
       headers: { 'Content-Type': 'application/json' },
     });

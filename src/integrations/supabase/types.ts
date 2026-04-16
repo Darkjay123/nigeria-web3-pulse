@@ -31,6 +31,8 @@ export type Database = {
           is_online: boolean
           organizer: string | null
           popularity_score: number | null
+          posted_at: string | null
+          posted_to_telegram: boolean
           registration_link: string | null
           source_platform: string | null
           source_url: string | null
@@ -58,6 +60,8 @@ export type Database = {
           is_online?: boolean
           organizer?: string | null
           popularity_score?: number | null
+          posted_at?: string | null
+          posted_to_telegram?: boolean
           registration_link?: string | null
           source_platform?: string | null
           source_url?: string | null
@@ -85,6 +89,8 @@ export type Database = {
           is_online?: boolean
           organizer?: string | null
           popularity_score?: number | null
+          posted_at?: string | null
+          posted_to_telegram?: boolean
           registration_link?: string | null
           source_platform?: string | null
           source_url?: string | null

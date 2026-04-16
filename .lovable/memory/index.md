@@ -8,5 +8,5 @@ Do NOT modify frontend UI unless explicitly asked.
 Admin page hidden from nav, accessible via direct URL only.
 
 ## Memories
-- [Automation pipeline](mem://features/automation) — Scraping (Luma, Eventbrite, Meetup, Firecrawl), hybrid filtering, dedup, enriched submissions, Telegram delivery
-- [Database schema](mem://features/db-schema) — Events, telegram tracking, scrape logs tables
+- [Automation pipeline v5](mem://features/automation) — Page Type Gate, X/Twitter discovery, fuzzy dedup, enhanced Telegram digests, strict quality filtering
+- [Database schema](mem://features/db-schema) — Events (with posted_to_telegram), telegram tracking, scrape logs tables
