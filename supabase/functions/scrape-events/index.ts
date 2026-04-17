@@ -199,9 +199,63 @@ function hasEventStructure(text: string): { pass: boolean; signals: number; hasD
  * - Event structure (≥2 signals)
  * - MUST have a real date signal
  */
-function pageTypeGate(raw: { title: string; description?: string; source_url?: string }): { pass: boolean; reason: string } {
-  const url = raw.source_url || "";
-  const fullText = `${raw.title} ${raw.description || ""}`;
+/**
+ * NORMALIZER (v7) — runs FIRST. Produces a uniform shape regardless of source.
+ * Centralises date detection from BOTH metadata and text so downstream gates can trust it.
+ */
+interface NormalizedEvent {
+  title: string;
+  description: string;
+  source_url: string | null;
+  registration_link: string | null;
+  source_platform: string;
+  venue: string | null;
+  city: string | null;
+  event_date: string | null;        // YYYY-MM-DD
+  event_time: string | null;
+  end_date: string | null;
+  organizer: string | null;
+  is_online: boolean;
+  has_metadata_date: boolean;       // true if date came from API/JSON-LD, not text
+  _submission_count?: number;
+}
+
+function normalizeEvent(raw: any): NormalizedEvent {
+  const title = (raw.title || "").toString().trim();
+  const description = (raw.description || "").toString();
+  const fullText = `${title} ${description} ${raw.venue || ""} ${raw.city || ""}`;
+
+  const metaDate = raw.event_date || raw.metadata?.event_date || null;
+  const textDate = !metaDate ? extractDate(fullText) : null;
+
+  return {
+    title,
+    description,
+    source_url: raw.source_url || null,
+    registration_link: raw.registration_link || raw.source_url || null,
+    source_platform: raw.source_platform || "unknown",
+    venue: raw.venue || null,
+    city: raw.city || null,
+    event_date: metaDate || textDate,
+    event_time: raw.event_time || null,
+    end_date: raw.end_date || null,
+    organizer: raw.organizer || null,
+    is_online: !!raw.is_online || detectIsOnline(fullText),
+    has_metadata_date: !!metaDate,
+    _submission_count: raw._submission_count,
+  };
+}
+
+/**
+ * PAGE TYPE GATE (Stage 1 — Hard Filters, deterministic, METADATA-AWARE):
+ * - Domain filter
+ * - Listicle / blog detection (title + body)
+ * - Event structure (≥2 signals)
+ * - Date requirement: satisfied by EITHER text-date OR metadata date (fixes Luma false-rejects)
+ */
+function pageTypeGate(ev: NormalizedEvent): { pass: boolean; reason: string } {
+  const url = ev.source_url || "";
+  const fullText = `${ev.title} ${ev.description}`;
 
   // A) Domain check
   const domainStatus = isAllowedDomain(url);
@@ -210,19 +264,20 @@ function pageTypeGate(raw: { title: string; description?: string; source_url?: s
   }
 
   // B) Listicle / blog detection
-  if (isListArticle(raw.title, fullText)) {
+  if (isListArticle(ev.title, fullText)) {
     return { pass: false, reason: "listicle/blog content detected" };
   }
 
-  // C) Structure check (mandatory for unknown domains, recommended for all)
+  // C) Structure check
   const structure = hasEventStructure(fullText);
   if (domainStatus === "unknown" && !structure.pass) {
     return { pass: false, reason: `unknown domain, weak event structure (signals=${structure.signals})` };
   }
 
-  // D) Hard reject if no specific date — except for whitelisted platforms where date may live in metadata
-  if (domainStatus !== "allowed" && !structure.hasDate) {
-    return { pass: false, reason: "no specific date found" };
+  // D) Date requirement — metadata-aware (FIX: previously rejected valid Luma events)
+  const hasValidDate = structure.hasDate || ev.has_metadata_date || !!ev.event_date;
+  if (domainStatus !== "allowed" && !hasValidDate) {
+    return { pass: false, reason: "no specific date found (text or metadata)" };
   }
 
   return { pass: true, reason: "ok" };
