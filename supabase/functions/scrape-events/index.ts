@@ -133,21 +133,34 @@ function isAllowedDomain(url: string): "allowed" | "blocked" | "unknown" {
   }
 }
 
+// Strong title-only listicle indicators (high precision)
+const STRONG_LISTICLE_TITLE_RE = /\b(top\s+\d+|best\s+\d+|\d+\s+(?:best|top|biggest|hottest|upcoming)|list\s+of|roundup|round-up|things\s+to\s+do|events?\s+this\s+(?:week|month|year))\b/i;
+
+function hasSingleEventIdentifier(text: string): boolean {
+  // Single-event identifier: explicit registration verb + a date-ish token nearby
+  const hasReg = /\b(register|rsvp|get\s+tickets?|reserve|sign\s+up|book\s+now)\b/i.test(text);
+  const hasDateish = /\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/i.test(text);
+  return hasReg && hasDateish;
+}
+
 function isListArticle(title: string, text: string): boolean {
-  // Hard reject by title pattern
+  // 1) Strong title-pattern reject (high precision, low false-positive)
+  if (STRONG_LISTICLE_TITLE_RE.test(title)) return true;
   for (const pat of LISTICLE_TITLE_PATTERNS) {
     if (pat.test(title)) return true;
   }
   const lowerTitle = title.toLowerCase();
+  // 2) Title starts with classic listicle phrase
   for (const phrase of LIST_ARTICLE_PHRASES) {
-    if (lowerTitle.startsWith(phrase) || lowerTitle.includes(` ${phrase}`)) return true;
+    if (lowerTitle.startsWith(phrase)) return true;
   }
-  // Body check — need 2+ phrase hits
-  const lower = text.toLowerCase().substring(0, 800);
+  // 3) Body check — only if no single-event identifier present, require ≥3 phrase hits (was 2 — too aggressive)
+  if (hasSingleEventIdentifier(text)) return false;
+  const lower = text.toLowerCase().substring(0, 1200);
   let matches = 0;
   for (const phrase of LIST_ARTICLE_PHRASES) {
     if (lower.includes(phrase)) matches++;
-    if (matches >= 2) return true;
+    if (matches >= 3) return true;
   }
   return false;
 }
@@ -186,9 +199,63 @@ function hasEventStructure(text: string): { pass: boolean; signals: number; hasD
  * - Event structure (≥2 signals)
  * - MUST have a real date signal
  */
-function pageTypeGate(raw: { title: string; description?: string; source_url?: string }): { pass: boolean; reason: string } {
-  const url = raw.source_url || "";
-  const fullText = `${raw.title} ${raw.description || ""}`;
+/**
+ * NORMALIZER (v7) — runs FIRST. Produces a uniform shape regardless of source.
+ * Centralises date detection from BOTH metadata and text so downstream gates can trust it.
+ */
+interface NormalizedEvent {
+  title: string;
+  description: string;
+  source_url: string | null;
+  registration_link: string | null;
+  source_platform: string;
+  venue: string | null;
+  city: string | null;
+  event_date: string | null;        // YYYY-MM-DD
+  event_time: string | null;
+  end_date: string | null;
+  organizer: string | null;
+  is_online: boolean;
+  has_metadata_date: boolean;       // true if date came from API/JSON-LD, not text
+  _submission_count?: number;
+}
+
+function normalizeEvent(raw: any): NormalizedEvent {
+  const title = (raw.title || "").toString().trim();
+  const description = (raw.description || "").toString();
+  const fullText = `${title} ${description} ${raw.venue || ""} ${raw.city || ""}`;
+
+  const metaDate = raw.event_date || raw.metadata?.event_date || null;
+  const textDate = !metaDate ? extractDate(fullText) : null;
+
+  return {
+    title,
+    description,
+    source_url: raw.source_url || null,
+    registration_link: raw.registration_link || raw.source_url || null,
+    source_platform: raw.source_platform || "unknown",
+    venue: raw.venue || null,
+    city: raw.city || null,
+    event_date: metaDate || textDate,
+    event_time: raw.event_time || null,
+    end_date: raw.end_date || null,
+    organizer: raw.organizer || null,
+    is_online: !!raw.is_online || detectIsOnline(fullText),
+    has_metadata_date: !!metaDate,
+    _submission_count: raw._submission_count,
+  };
+}
+
+/**
+ * PAGE TYPE GATE (Stage 1 — Hard Filters, deterministic, METADATA-AWARE):
+ * - Domain filter
+ * - Listicle / blog detection (title + body)
+ * - Event structure (≥2 signals)
+ * - Date requirement: satisfied by EITHER text-date OR metadata date (fixes Luma false-rejects)
+ */
+function pageTypeGate(ev: NormalizedEvent): { pass: boolean; reason: string } {
+  const url = ev.source_url || "";
+  const fullText = `${ev.title} ${ev.description}`;
 
   // A) Domain check
   const domainStatus = isAllowedDomain(url);
@@ -197,19 +264,20 @@ function pageTypeGate(raw: { title: string; description?: string; source_url?: s
   }
 
   // B) Listicle / blog detection
-  if (isListArticle(raw.title, fullText)) {
+  if (isListArticle(ev.title, fullText)) {
     return { pass: false, reason: "listicle/blog content detected" };
   }
 
-  // C) Structure check (mandatory for unknown domains, recommended for all)
+  // C) Structure check
   const structure = hasEventStructure(fullText);
   if (domainStatus === "unknown" && !structure.pass) {
     return { pass: false, reason: `unknown domain, weak event structure (signals=${structure.signals})` };
   }
 
-  // D) Hard reject if no specific date — except for whitelisted platforms where date may live in metadata
-  if (domainStatus !== "allowed" && !structure.hasDate) {
-    return { pass: false, reason: "no specific date found" };
+  // D) Date requirement — metadata-aware (FIX: previously rejected valid Luma events)
+  const hasValidDate = structure.hasDate || ev.has_metadata_date || !!ev.event_date;
+  if (domainStatus !== "allowed" && !hasValidDate) {
+    return { pass: false, reason: "no specific date found (text or metadata)" };
   }
 
   return { pass: true, reason: "ok" };
@@ -468,6 +536,17 @@ async function isDuplicateEvent(
         if (titleSimilarity(title, ev.title) > 0.7) return true;
       }
     }
+  } else {
+    // 4) Cross-platform fallback (no date) — strict similarity threshold
+    const { data: noDateCandidates } = await supabase
+      .from('events')
+      .select('id, title')
+      .limit(200);
+    if (noDateCandidates) {
+      for (const ev of noDateCandidates) {
+        if (titleSimilarity(title, ev.title) > 0.85) return true;
+      }
+    }
   }
 
   return false;
@@ -723,7 +802,30 @@ async function scrapeMeetupEvents(): Promise<any[]> {
   return events;
 }
 
-// ============ HYBRID FILTER PIPELINE ============
+// ============ HYBRID FILTER PIPELINE (v7) ============
+
+/**
+ * FINAL VALIDATOR — single source of truth.
+ * Combines AI classification (signals only) + normalized event facts.
+ * AI is now classification-only; structural rules live HERE.
+ */
+function finalValidate(ev: NormalizedEvent, ai: AIClassification): { ok: boolean; reason: string } {
+  if (!ai.is_event) return { ok: false, reason: `AI: not an event (${ai.reason})` };
+  if (ai.is_listicle) return { ok: false, reason: `AI: listicle (${ai.reason})` };
+  if (ai.confidence < 0.85) return { ok: false, reason: `AI: low confidence ${ai.confidence}` };
+
+  const eventDate = ai.event_date || ev.event_date;
+  if (!eventDate) return { ok: false, reason: "no resolvable date (text+metadata+AI all empty)" };
+
+  const isOnline = ai.is_online || ev.is_online;
+  const hasLocation = !!ev.venue || !!ev.city || !!ai.city || !!ai.state || isOnline;
+  if (!hasLocation) return { ok: false, reason: "no location (no venue/city/online)" };
+
+  const hasRegistration = !!ev.registration_link || !!ev.source_url || ai.has_registration;
+  if (!hasRegistration) return { ok: false, reason: "no registration link" };
+
+  return { ok: true, reason: "ok" };
+}
 
 async function processEvent(
   raw: any,
@@ -732,101 +834,96 @@ async function processEvent(
   lovableApiKey: string,
   stats: any
 ): Promise<boolean> {
-  if (!raw.title || raw.title.length < 5) return false;
+  // STAGE 0: NORMALIZE — uniform shape, metadata-aware date extraction
+  const ev = normalizeEvent(raw);
+  if (!ev.title || ev.title.length < 5) return false;
 
-  const fullText = `${raw.title || ''} ${raw.description || ''} ${raw.venue || ''} ${raw.city || ''}`;
+  const fullText = `${ev.title} ${ev.description} ${ev.venue || ''} ${ev.city || ''}`;
 
-  // STAGE 0: Page Type Gate
-  const gate = pageTypeGate(raw);
+  // STAGE 1: Page Type Gate (now metadata-aware)
+  const gate = pageTypeGate(ev);
   if (!gate.pass) {
     stats.filtered_gate++;
-    console.log(`[GATE REJECT] "${raw.title}" — ${gate.reason}`);
+    console.log(`[GATE REJECT] "${ev.title}" — ${gate.reason}`);
     return false;
   }
 
-  // STAGE 1: Keyword pre-filter
+  // STAGE 2: Web3 keyword pre-filter
   const kwScore = web3KeywordScore(fullText);
   if (kwScore < 2) {
     stats.filtered_keyword++;
-    console.log(`[KEYWORD REJECT] "${raw.title}" (score=${kwScore})`);
+    console.log(`[KEYWORD REJECT] "${ev.title}" (score=${kwScore})`);
     return false;
   }
 
-  // STAGE 2: AI classification (STRICT — confidence >= 0.85, all signals required)
+  // STAGE 3: AI classification (CLASSIFICATION ONLY — no enforcement here)
   if (!lovableApiKey) {
     stats.filtered_ai++;
-    console.log(`[AI SKIP-REJECT] "${raw.title}" — no AI key configured`);
+    console.log(`[AI SKIP-REJECT] "${ev.title}" — no AI key`);
     return false;
   }
 
   const aiResult = await classifyWithAI(
-    { title: raw.title, description: raw.description, venue: raw.venue, city: raw.city, source_url: raw.source_url },
+    { title: ev.title, description: ev.description, venue: ev.venue || undefined, city: ev.city || undefined, source_url: ev.source_url || undefined },
     lovableApiKey
   );
 
   if (!aiResult) {
     stats.filtered_ai++;
-    console.log(`[AI REJECT] "${raw.title}" — classifier failed`);
+    console.log(`[AI REJECT] "${ev.title}" — classifier failed`);
     return false;
   }
 
-  const acceptedByAI =
-    aiResult.is_event === true &&
-    aiResult.is_listicle === false &&
-    aiResult.has_real_date === true &&
-    (aiResult.has_location === true || aiResult.is_online === true) &&
-    aiResult.has_registration === true &&
-    aiResult.confidence >= 0.85;
-
-  if (!acceptedByAI) {
+  // STAGE 4: FINAL VALIDATOR (single source of truth)
+  const verdict = finalValidate(ev, aiResult);
+  if (!verdict.ok) {
     stats.filtered_ai++;
-    console.log(`[AI REJECT] "${raw.title}" — confidence=${aiResult.confidence} reason="${aiResult.reason}" event=${aiResult.is_event} listicle=${aiResult.is_listicle} date=${aiResult.has_real_date} loc=${aiResult.has_location} reg=${aiResult.has_registration}`);
+    console.log(`[FINAL REJECT] "${ev.title}" — ${verdict.reason} | AI conf=${aiResult.confidence}`);
     return false;
   }
-  console.log(`[AI ACCEPT] "${raw.title}" (confidence=${aiResult.confidence})`);
+  console.log(`[ACCEPT] "${ev.title}" (confidence=${aiResult.confidence})`);
 
-  // Build event record from AI + raw
-  const state = aiResult.state || detectState(fullText);
+  // Build final record
+  const eventDate = aiResult.event_date || ev.event_date;
+  const isOnline = aiResult.is_online || ev.is_online;
+  const detectedState = aiResult.state || detectState(fullText);
+  const resolvedState = !detectedState || detectedState === "Unknown" ? (isOnline ? "Online" : "Lagos") : detectedState;
   const eventType = aiResult.event_type || detectEventType(fullText);
-  const isOnline = state === "Online" || aiResult.is_online || raw.is_online || detectIsOnline(fullText);
-  const eventDate = aiResult.event_date || raw.event_date || extractDate(fullText);
-  const city = aiResult.city || raw.city || null;
+  const city = aiResult.city || ev.city || null;
   const tags = aiResult.tags || [];
   const confidenceScore = aiResult.confidence;
+  const dedupHash = await generateDedupHash(ev.title, eventDate, resolvedState);
 
-  const resolvedState = !state || state === "Unknown" ? (isOnline ? "Online" : "Lagos") : state;
-  const dedupHash = await generateDedupHash(raw.title, eventDate, resolvedState);
-
-  // STAGE 3: Improved dedup
-  const isDupe = await isDuplicateEvent(raw.title, eventDate, raw.registration_link, raw.source_url, dedupHash, supabase);
+  // STAGE 5: Dedup
+  const isDupe = await isDuplicateEvent(ev.title, eventDate, ev.registration_link, ev.source_url, dedupHash, supabase);
   if (isDupe) {
     stats.duplicates++;
     return false;
   }
 
-  const submissionCount = raw._submission_count || 0;
+  const submissionCount = ev._submission_count || 0;
   const popularityScore = (submissionCount * 0.4) + (confidenceScore * 0.6);
 
   const { error } = await supabase.from('events').insert({
-    title: raw.title.substring(0, 500),
-    description: raw.description?.substring(0, 2000) || null,
+    title: ev.title.substring(0, 500),
+    description: ev.description?.substring(0, 2000) || null,
     city,
     state: resolvedState,
     country: "Nigeria",
-    venue: raw.venue || null,
+    venue: ev.venue,
     event_date: eventDate,
-    event_time: raw.event_time || null,
-    end_date: raw.end_date || null,
-    organizer: raw.organizer || null,
-    registration_link: raw.registration_link || null,
-    source_url: raw.source_url || null,
+    event_time: ev.event_time,
+    end_date: ev.end_date,
+    organizer: ev.organizer,
+    registration_link: ev.registration_link,
+    source_url: ev.source_url,
     event_type: eventType,
     tags,
     is_online: isOnline,
     confidence_score: confidenceScore,
     dedup_hash: dedupHash,
     status: 'upcoming',
-    source_platform: raw.source_platform || sourceName,
+    source_platform: ev.source_platform || sourceName,
     image_url: null,
     submission_count: submissionCount,
     popularity_score: popularityScore,
@@ -840,7 +937,7 @@ async function processEvent(
   }
 
   stats.inserted++;
-  console.log(`INSERTED: "${raw.title}" [${eventType}] confidence=${confidenceScore}`);
+  console.log(`INSERTED: "${ev.title}" [${eventType}] confidence=${confidenceScore}`);
   return true;
 }
 
