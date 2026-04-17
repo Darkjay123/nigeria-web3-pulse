@@ -744,34 +744,49 @@ async function processEvent(
     return false;
   }
 
-  // STAGE 2: AI classification
-  let aiResult: AIClassification | null = null;
-  if (lovableApiKey) {
-    aiResult = await classifyWithAI(
-      { title: raw.title, description: raw.description, venue: raw.venue, city: raw.city },
-      lovableApiKey
-    );
+  // STAGE 2: AI classification (STRICT — confidence >= 0.85, all signals required)
+  if (!lovableApiKey) {
+    stats.filtered_ai++;
+    console.log(`[AI SKIP-REJECT] "${raw.title}" — no AI key configured`);
+    return false;
   }
 
-  if (aiResult) {
-    if (!aiResult.relevant || aiResult.confidence_score < 0.5) {
-      stats.filtered_ai++;
-      console.log(`[AI REJECT] "${raw.title}" (relevant=${aiResult.relevant}, confidence=${aiResult.confidence_score})`);
-      return false;
-    }
-    console.log(`[AI ACCEPT] "${raw.title}" (confidence=${aiResult.confidence_score})`);
+  const aiResult = await classifyWithAI(
+    { title: raw.title, description: raw.description, venue: raw.venue, city: raw.city, source_url: raw.source_url },
+    lovableApiKey
+  );
+
+  if (!aiResult) {
+    stats.filtered_ai++;
+    console.log(`[AI REJECT] "${raw.title}" — classifier failed`);
+    return false;
   }
 
-  // Build event record
-  const state = aiResult?.state || detectState(fullText);
-  const eventType = aiResult?.event_type || detectEventType(fullText);
-  const isOnline = state === "Online" || raw.is_online || detectIsOnline(fullText);
-  const eventDate = aiResult?.event_date || raw.event_date || extractDate(fullText);
-  const city = aiResult?.city || raw.city || null;
-  const tags = aiResult?.tags || [];
-  const confidenceScore = aiResult?.confidence_score || computeConfidence({ ...raw, state, event_date: eventDate });
+  const acceptedByAI =
+    aiResult.is_event === true &&
+    aiResult.is_listicle === false &&
+    aiResult.has_real_date === true &&
+    (aiResult.has_location === true || aiResult.is_online === true) &&
+    aiResult.has_registration === true &&
+    aiResult.confidence >= 0.85;
 
-  const resolvedState = state === "Unknown" ? (isOnline ? "Online" : "Lagos") : state;
+  if (!acceptedByAI) {
+    stats.filtered_ai++;
+    console.log(`[AI REJECT] "${raw.title}" — confidence=${aiResult.confidence} reason="${aiResult.reason}" event=${aiResult.is_event} listicle=${aiResult.is_listicle} date=${aiResult.has_real_date} loc=${aiResult.has_location} reg=${aiResult.has_registration}`);
+    return false;
+  }
+  console.log(`[AI ACCEPT] "${raw.title}" (confidence=${aiResult.confidence})`);
+
+  // Build event record from AI + raw
+  const state = aiResult.state || detectState(fullText);
+  const eventType = aiResult.event_type || detectEventType(fullText);
+  const isOnline = state === "Online" || aiResult.is_online || raw.is_online || detectIsOnline(fullText);
+  const eventDate = aiResult.event_date || raw.event_date || extractDate(fullText);
+  const city = aiResult.city || raw.city || null;
+  const tags = aiResult.tags || [];
+  const confidenceScore = aiResult.confidence;
+
+  const resolvedState = !state || state === "Unknown" ? (isOnline ? "Online" : "Lagos") : state;
   const dedupHash = await generateDedupHash(raw.title, eventDate, resolvedState);
 
   // STAGE 3: Improved dedup
