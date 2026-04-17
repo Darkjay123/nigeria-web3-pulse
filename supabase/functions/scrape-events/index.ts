@@ -94,6 +94,22 @@ const LIST_ARTICLE_PHRASES = [
   "read more", "related articles", "you might also like",
   "table of contents", "written by", "published on",
   "share this", "comments section",
+  "things to do", "events this week", "we've compiled", "we have compiled",
+  "roundup", "round-up", "ultimate guide", "complete guide",
+  "discover the", "explore the", "check out these", "check out the",
+  "top 5", "top 10", "top 20", "best of", "must attend", "must-attend",
+];
+
+// Title-only blacklist patterns (listicle / blog signals)
+const LISTICLE_TITLE_PATTERNS = [
+  /^\s*top\s+\d+/i,
+  /^\s*best\s+\d+/i,
+  /^\s*\d+\s+(?:best|top|biggest|hottest|upcoming)/i,
+  /^\s*(?:the\s+)?ultimate\s+guide/i,
+  /^\s*(?:the\s+)?complete\s+guide/i,
+  /\broundup\b/i,
+  /\bevents?\s+this\s+(?:week|month|year)\b/i,
+  /\bthings\s+to\s+do\b/i,
 ];
 
 const EVENT_STRUCTURE_SIGNALS = [
