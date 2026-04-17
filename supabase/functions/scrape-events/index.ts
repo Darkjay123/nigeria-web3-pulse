@@ -802,7 +802,30 @@ async function scrapeMeetupEvents(): Promise<any[]> {
   return events;
 }
 
-// ============ HYBRID FILTER PIPELINE ============
+// ============ HYBRID FILTER PIPELINE (v7) ============
+
+/**
+ * FINAL VALIDATOR — single source of truth.
+ * Combines AI classification (signals only) + normalized event facts.
+ * AI is now classification-only; structural rules live HERE.
+ */
+function finalValidate(ev: NormalizedEvent, ai: AIClassification): { ok: boolean; reason: string } {
+  if (!ai.is_event) return { ok: false, reason: `AI: not an event (${ai.reason})` };
+  if (ai.is_listicle) return { ok: false, reason: `AI: listicle (${ai.reason})` };
+  if (ai.confidence < 0.85) return { ok: false, reason: `AI: low confidence ${ai.confidence}` };
+
+  const eventDate = ai.event_date || ev.event_date;
+  if (!eventDate) return { ok: false, reason: "no resolvable date (text+metadata+AI all empty)" };
+
+  const isOnline = ai.is_online || ev.is_online;
+  const hasLocation = !!ev.venue || !!ev.city || !!ai.city || !!ai.state || isOnline;
+  if (!hasLocation) return { ok: false, reason: "no location (no venue/city/online)" };
+
+  const hasRegistration = !!ev.registration_link || !!ev.source_url || ai.has_registration;
+  if (!hasRegistration) return { ok: false, reason: "no registration link" };
+
+  return { ok: true, reason: "ok" };
+}
 
 async function processEvent(
   raw: any,
@@ -811,101 +834,96 @@ async function processEvent(
   lovableApiKey: string,
   stats: any
 ): Promise<boolean> {
-  if (!raw.title || raw.title.length < 5) return false;
+  // STAGE 0: NORMALIZE — uniform shape, metadata-aware date extraction
+  const ev = normalizeEvent(raw);
+  if (!ev.title || ev.title.length < 5) return false;
 
-  const fullText = `${raw.title || ''} ${raw.description || ''} ${raw.venue || ''} ${raw.city || ''}`;
+  const fullText = `${ev.title} ${ev.description} ${ev.venue || ''} ${ev.city || ''}`;
 
-  // STAGE 0: Page Type Gate
-  const gate = pageTypeGate(raw);
+  // STAGE 1: Page Type Gate (now metadata-aware)
+  const gate = pageTypeGate(ev);
   if (!gate.pass) {
     stats.filtered_gate++;
-    console.log(`[GATE REJECT] "${raw.title}" — ${gate.reason}`);
+    console.log(`[GATE REJECT] "${ev.title}" — ${gate.reason}`);
     return false;
   }
 
-  // STAGE 1: Keyword pre-filter
+  // STAGE 2: Web3 keyword pre-filter
   const kwScore = web3KeywordScore(fullText);
   if (kwScore < 2) {
     stats.filtered_keyword++;
-    console.log(`[KEYWORD REJECT] "${raw.title}" (score=${kwScore})`);
+    console.log(`[KEYWORD REJECT] "${ev.title}" (score=${kwScore})`);
     return false;
   }
 
-  // STAGE 2: AI classification (STRICT — confidence >= 0.85, all signals required)
+  // STAGE 3: AI classification (CLASSIFICATION ONLY — no enforcement here)
   if (!lovableApiKey) {
     stats.filtered_ai++;
-    console.log(`[AI SKIP-REJECT] "${raw.title}" — no AI key configured`);
+    console.log(`[AI SKIP-REJECT] "${ev.title}" — no AI key`);
     return false;
   }
 
   const aiResult = await classifyWithAI(
-    { title: raw.title, description: raw.description, venue: raw.venue, city: raw.city, source_url: raw.source_url },
+    { title: ev.title, description: ev.description, venue: ev.venue || undefined, city: ev.city || undefined, source_url: ev.source_url || undefined },
     lovableApiKey
   );
 
   if (!aiResult) {
     stats.filtered_ai++;
-    console.log(`[AI REJECT] "${raw.title}" — classifier failed`);
+    console.log(`[AI REJECT] "${ev.title}" — classifier failed`);
     return false;
   }
 
-  const acceptedByAI =
-    aiResult.is_event === true &&
-    aiResult.is_listicle === false &&
-    aiResult.has_real_date === true &&
-    (aiResult.has_location === true || aiResult.is_online === true) &&
-    aiResult.has_registration === true &&
-    aiResult.confidence >= 0.85;
-
-  if (!acceptedByAI) {
+  // STAGE 4: FINAL VALIDATOR (single source of truth)
+  const verdict = finalValidate(ev, aiResult);
+  if (!verdict.ok) {
     stats.filtered_ai++;
-    console.log(`[AI REJECT] "${raw.title}" — confidence=${aiResult.confidence} reason="${aiResult.reason}" event=${aiResult.is_event} listicle=${aiResult.is_listicle} date=${aiResult.has_real_date} loc=${aiResult.has_location} reg=${aiResult.has_registration}`);
+    console.log(`[FINAL REJECT] "${ev.title}" — ${verdict.reason} | AI conf=${aiResult.confidence}`);
     return false;
   }
-  console.log(`[AI ACCEPT] "${raw.title}" (confidence=${aiResult.confidence})`);
+  console.log(`[ACCEPT] "${ev.title}" (confidence=${aiResult.confidence})`);
 
-  // Build event record from AI + raw
-  const state = aiResult.state || detectState(fullText);
+  // Build final record
+  const eventDate = aiResult.event_date || ev.event_date;
+  const isOnline = aiResult.is_online || ev.is_online;
+  const detectedState = aiResult.state || detectState(fullText);
+  const resolvedState = !detectedState || detectedState === "Unknown" ? (isOnline ? "Online" : "Lagos") : detectedState;
   const eventType = aiResult.event_type || detectEventType(fullText);
-  const isOnline = state === "Online" || aiResult.is_online || raw.is_online || detectIsOnline(fullText);
-  const eventDate = aiResult.event_date || raw.event_date || extractDate(fullText);
-  const city = aiResult.city || raw.city || null;
+  const city = aiResult.city || ev.city || null;
   const tags = aiResult.tags || [];
   const confidenceScore = aiResult.confidence;
+  const dedupHash = await generateDedupHash(ev.title, eventDate, resolvedState);
 
-  const resolvedState = !state || state === "Unknown" ? (isOnline ? "Online" : "Lagos") : state;
-  const dedupHash = await generateDedupHash(raw.title, eventDate, resolvedState);
-
-  // STAGE 3: Improved dedup
-  const isDupe = await isDuplicateEvent(raw.title, eventDate, raw.registration_link, raw.source_url, dedupHash, supabase);
+  // STAGE 5: Dedup
+  const isDupe = await isDuplicateEvent(ev.title, eventDate, ev.registration_link, ev.source_url, dedupHash, supabase);
   if (isDupe) {
     stats.duplicates++;
     return false;
   }
 
-  const submissionCount = raw._submission_count || 0;
+  const submissionCount = ev._submission_count || 0;
   const popularityScore = (submissionCount * 0.4) + (confidenceScore * 0.6);
 
   const { error } = await supabase.from('events').insert({
-    title: raw.title.substring(0, 500),
-    description: raw.description?.substring(0, 2000) || null,
+    title: ev.title.substring(0, 500),
+    description: ev.description?.substring(0, 2000) || null,
     city,
     state: resolvedState,
     country: "Nigeria",
-    venue: raw.venue || null,
+    venue: ev.venue,
     event_date: eventDate,
-    event_time: raw.event_time || null,
-    end_date: raw.end_date || null,
-    organizer: raw.organizer || null,
-    registration_link: raw.registration_link || null,
-    source_url: raw.source_url || null,
+    event_time: ev.event_time,
+    end_date: ev.end_date,
+    organizer: ev.organizer,
+    registration_link: ev.registration_link,
+    source_url: ev.source_url,
     event_type: eventType,
     tags,
     is_online: isOnline,
     confidence_score: confidenceScore,
     dedup_hash: dedupHash,
     status: 'upcoming',
-    source_platform: raw.source_platform || sourceName,
+    source_platform: ev.source_platform || sourceName,
     image_url: null,
     submission_count: submissionCount,
     popularity_score: popularityScore,
@@ -919,7 +937,7 @@ async function processEvent(
   }
 
   stats.inserted++;
-  console.log(`INSERTED: "${raw.title}" [${eventType}] confidence=${confidenceScore}`);
+  console.log(`INSERTED: "${ev.title}" [${eventType}] confidence=${confidenceScore}`);
   return true;
 }
 
