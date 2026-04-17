@@ -590,15 +590,9 @@ async function scrapeLumaEvents(): Promise<any[]> {
       const resp = await fetch(url, { headers: { 'Accept': 'application/json' } });
 
       if (!resp.ok) {
-        const htmlResp = await fetch(`https://lu.ma/discover?query=${query}`);
-        if (htmlResp.ok) {
-          const html = await htmlResp.text();
-          const titleMatches = html.matchAll(/<h[1-3][^>]*>([^<]{10,100})<\/h[1-3]>/gi);
-          for (const m of titleMatches) {
-            const title = m[1].trim();
-            if (title.length > 10) events.push({ title, source_platform: "luma" });
-          }
-        }
+        // No HTML fallback — the section-headings it scraped were noise that wasted the pipeline.
+        // If the Luma JSON API fails, skip this query entirely.
+        console.warn(`[Luma] API failed for "${query}" (${resp.status}), skipping`);
         continue;
       }
 
