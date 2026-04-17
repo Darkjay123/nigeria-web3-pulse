@@ -133,46 +133,58 @@ function isAllowedDomain(url: string): "allowed" | "blocked" | "unknown" {
   }
 }
 
-function isListArticle(text: string): boolean {
-  const lower = text.toLowerCase().substring(0, 500);
+function isListArticle(title: string, text: string): boolean {
+  // Hard reject by title pattern
+  for (const pat of LISTICLE_TITLE_PATTERNS) {
+    if (pat.test(title)) return true;
+  }
+  const lowerTitle = title.toLowerCase();
+  for (const phrase of LIST_ARTICLE_PHRASES) {
+    if (lowerTitle.startsWith(phrase) || lowerTitle.includes(` ${phrase}`)) return true;
+  }
+  // Body check — need 2+ phrase hits
+  const lower = text.toLowerCase().substring(0, 800);
   let matches = 0;
   for (const phrase of LIST_ARTICLE_PHRASES) {
     if (lower.includes(phrase)) matches++;
+    if (matches >= 2) return true;
   }
-  return matches >= 2;
+  return false;
 }
 
-function hasEventStructure(text: string): { pass: boolean; signals: number } {
+function hasEventStructure(text: string): { pass: boolean; signals: number; hasDate: boolean } {
   const lower = text.toLowerCase();
   let signals = 0;
 
-  // Check for date patterns
-  const hasDate = /\d{4}-\d{2}-\d{2}/.test(text) ||
-    /\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/i.test(text) ||
-    /(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}/i.test(text) ||
-    /(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i.test(text);
+  // Specific date: ISO, "12 Jan 2026", "Jan 12, 2026", etc. — NOT vague "this week"
+  const hasDate = /\b\d{4}-\d{2}-\d{2}\b/.test(text) ||
+    /\b\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}\b/i.test(text) ||
+    /\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}\b/i.test(text);
   if (hasDate) signals++;
 
-  // Check for time
-  const hasTime = /\d{1,2}:\d{2}\s*(?:am|pm|AM|PM)?/.test(text) ||
-    /\d{1,2}\s*(?:am|pm|AM|PM)/.test(text);
+  // Specific time
+  const hasTime = /\b\d{1,2}:\d{2}\s*(?:am|pm|AM|PM)?\b/.test(text) ||
+    /\b\d{1,2}\s*(?:am|pm|AM|PM)\b/.test(text);
   if (hasTime) signals++;
 
-  // Check for registration/RSVP language
+  // Registration / RSVP language
   for (const sig of EVENT_STRUCTURE_SIGNALS) {
     if (lower.includes(sig)) { signals++; break; }
   }
 
-  // Check for venue/location
-  const hasVenue = /venue|location|address|hall|center|centre|hotel|hub|space/i.test(text);
-  if (hasVenue) signals++;
+  // Venue/location or explicit "online event"
+  const hasLocation = /\b(?:venue|location|address|hall|center|centre|hotel|hub|space|online event|virtual event)\b/i.test(text);
+  if (hasLocation) signals++;
 
-  return { pass: signals >= 2, signals };
+  return { pass: signals >= 2, signals, hasDate };
 }
 
 /**
- * PAGE TYPE GATE: Returns true if the event candidate should proceed to AI.
- * Returns false (with reason) if it should be rejected.
+ * PAGE TYPE GATE (Stage 1 — Hard Filters, deterministic):
+ * - Domain filter
+ * - Listicle / blog detection (title + body)
+ * - Event structure (≥2 signals)
+ * - MUST have a real date signal
  */
 function pageTypeGate(raw: { title: string; description?: string; source_url?: string }): { pass: boolean; reason: string } {
   const url = raw.source_url || "";
@@ -184,24 +196,20 @@ function pageTypeGate(raw: { title: string; description?: string; source_url?: s
     return { pass: false, reason: `blocked domain: ${url}` };
   }
 
-  // B) Content rejection — list/article detection
-  if (isListArticle(fullText)) {
-    return { pass: false, reason: "list/article content detected" };
+  // B) Listicle / blog detection
+  if (isListArticle(raw.title, fullText)) {
+    return { pass: false, reason: "listicle/blog content detected" };
   }
 
-  // C) For unknown domains, require event structure
-  if (domainStatus === "unknown") {
-    const structure = hasEventStructure(fullText);
-    if (!structure.pass) {
-      return { pass: false, reason: `unknown domain, weak event structure (signals=${structure.signals})` };
-    }
+  // C) Structure check (mandatory for unknown domains, recommended for all)
+  const structure = hasEventStructure(fullText);
+  if (domainStatus === "unknown" && !structure.pass) {
+    return { pass: false, reason: `unknown domain, weak event structure (signals=${structure.signals})` };
   }
 
-  // D) Must have SOME date signal (hard reject if no date at all)
-  const hasAnyDate = /\d{4}|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b|(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i.test(fullText);
-  // Only enforce for non-event-platform sources
-  if (domainStatus !== "allowed" && !hasAnyDate) {
-    return { pass: false, reason: "no date signal found" };
+  // D) Hard reject if no specific date — except for whitelisted platforms where date may live in metadata
+  if (domainStatus !== "allowed" && !structure.hasDate) {
+    return { pass: false, reason: "no specific date found" };
   }
 
   return { pass: true, reason: "ok" };
