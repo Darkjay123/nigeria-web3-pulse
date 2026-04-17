@@ -220,44 +220,73 @@ function pageTypeGate(raw: { title: string; description?: string; source_url?: s
 const AI_GATEWAY_URL = "https://ai.gateway.lovable.dev/v1/chat/completions";
 
 interface AIClassification {
-  relevant: boolean;
+  is_event: boolean;
+  is_listicle: boolean;
   event_type: string;
-  tags: string[];
-  state: string;
-  city: string | null;
-  event_date: string | null;
-  confidence_score: number;
+  has_real_date: boolean;
+  has_location: boolean;
+  has_registration: boolean;
+  is_online: boolean;
+  confidence: number;
+  reason: string;
+  event_date?: string | null;
+  state?: string | null;
+  city?: string | null;
+  tags?: string[];
 }
 
 async function classifyWithAI(
-  event: { title: string; description?: string; venue?: string; city?: string },
+  event: { title: string; description?: string; venue?: string; city?: string; source_url?: string },
   apiKey: string
 ): Promise<AIClassification | null> {
-  const prompt = `You are a strict Web3 event classifier. Analyze this event and determine if it is genuinely about Web3/blockchain/crypto.
+  const userPrompt = `Analyze the following content and return STRICT JSON via the classify_event tool.
 
-EVENT:
+Reject if:
+- It is a blog post, news article, or general article
+- It is a listicle / list of multiple events ("Top 10...", "Best events...", roundups)
+- It does not describe ONE specific event with a real date
+- Web3/blockchain/crypto is not the CORE topic
+
+Accept ONLY if:
+- It describes ONE specific event
+- Has a clear specific date (not "this week" / "soon")
+- Has a clear physical location OR is explicitly online
+- Has a registration / participation method
+- Web3 / blockchain / crypto / DeFi / NFT / DAO is the CORE topic
+
+CONTENT:
 Title: ${event.title}
-Description: ${(event.description || "").substring(0, 800)}
+URL: ${event.source_url || "N/A"}
 Venue: ${event.venue || "N/A"}
 City: ${event.city || "N/A"}
+Description: ${(event.description || "").substring(0, 1500)}`;
 
-RULES:
-- ONLY mark relevant=true if Web3/blockchain/crypto is the CORE focus
-- Reject generic tech events (AI, SaaS, design, product) unless Web3 is central
-- Reject events with weak/passing crypto mentions
-- Reject news articles, blog posts, lists, or non-event pages
-- Accept niche deep Web3 topics (ZK, MEV, account abstraction, etc.)
-
-Respond with a JSON object using this exact structure:
-{
-  "relevant": boolean,
-  "event_type": "meetup"|"hackathon"|"workshop"|"conference"|"ama"|"online_session"|"bootcamp"|"summit"|"webinar"|"other",
-  "tags": string[] (from: defi, nft, dao, zk, layer2, trading, security, identity, gaming, ai+crypto, stablecoin, regulation, smart_contracts, infrastructure, community, education),
-  "state": string (Nigerian state name or "Online"),
-  "city": string or null,
-  "event_date": "YYYY-MM-DD" or null,
-  "confidence_score": number 0.0-1.0
-}`;
+  const tools = [{
+    type: "function",
+    function: {
+      name: "classify_event",
+      description: "Classify whether the content is a single, specific Web3 event.",
+      parameters: {
+        type: "object",
+        properties: {
+          is_event: { type: "boolean", description: "True only if this is ONE specific event (not a list, blog, or article)" },
+          is_listicle: { type: "boolean", description: "True if this is a list of multiple events, blog post, or article" },
+          event_type: { type: "string", enum: ["meetup", "hackathon", "workshop", "conference", "ama", "online_session", "bootcamp", "summit", "webinar", "other"] },
+          has_real_date: { type: "boolean", description: "True only if a SPECIFIC calendar date is present (not vague)" },
+          has_location: { type: "boolean", description: "True if a physical venue/city is present" },
+          has_registration: { type: "boolean", description: "True if registration/RSVP/ticket link or method exists" },
+          is_online: { type: "boolean", description: "True if the event is explicitly online/virtual" },
+          confidence: { type: "number", description: "0.0-1.0 confidence this is a real, specific Web3 event" },
+          reason: { type: "string", description: "Short explanation (max 120 chars)" },
+          event_date: { type: ["string", "null"], description: "YYYY-MM-DD if extractable, else null" },
+          state: { type: ["string", "null"], description: "Nigerian state name or 'Online'" },
+          city: { type: ["string", "null"] },
+          tags: { type: "array", items: { type: "string" } },
+        },
+        required: ["is_event", "is_listicle", "event_type", "has_real_date", "has_location", "has_registration", "is_online", "confidence", "reason"],
+      },
+    },
+  }];
 
   try {
     const resp = await fetch(AI_GATEWAY_URL, {
@@ -267,26 +296,29 @@ Respond with a JSON object using this exact structure:
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "google/gemini-2.5-flash-lite",
+        model: "google/gemini-2.5-flash",
         messages: [
-          { role: "system", content: "You are a strict Web3 event classifier. Output ONLY valid JSON, no markdown." },
-          { role: "user", content: prompt },
+          { role: "system", content: "You are an event classification engine. Be strict. Reject anything that is not a single, specific Web3 event. Bias toward rejection when in doubt." },
+          { role: "user", content: userPrompt },
         ],
-        temperature: 0.1,
+        tools,
+        tool_choice: { type: "function", function: { name: "classify_event" } },
+        temperature: 0.0,
       }),
     });
 
     if (!resp.ok) {
-      console.error(`[AI] Classification failed: ${resp.status}`);
+      console.error(`[AI] Classification failed: ${resp.status} ${await resp.text().catch(() => "")}`);
       return null;
     }
 
     const data = await resp.json();
-    const content = data.choices?.[0]?.message?.content?.trim();
-    if (!content) return null;
-
-    const jsonStr = content.replace(/^```json?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
-    return JSON.parse(jsonStr) as AIClassification;
+    const toolCall = data.choices?.[0]?.message?.tool_calls?.[0];
+    if (!toolCall?.function?.arguments) {
+      console.error('[AI] No tool call in response');
+      return null;
+    }
+    return JSON.parse(toolCall.function.arguments) as AIClassification;
   } catch (e) {
     console.error('[AI] Classification error:', e);
     return null;
