@@ -804,7 +804,7 @@ async function processEvent(
   const dedupHash = await generateDedupHash(raw.title, eventDate, resolvedState);
 
   // STAGE 3: Improved dedup
-  const isDupe = await isDuplicateEvent(raw.title, eventDate, raw.registration_link, dedupHash, supabase);
+  const isDupe = await isDuplicateEvent(raw.title, eventDate, raw.registration_link, raw.source_url, dedupHash, supabase);
   if (isDupe) {
     stats.duplicates++;
     return false;
