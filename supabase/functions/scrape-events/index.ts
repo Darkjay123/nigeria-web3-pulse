@@ -133,21 +133,34 @@ function isAllowedDomain(url: string): "allowed" | "blocked" | "unknown" {
   }
 }
 
+// Strong title-only listicle indicators (high precision)
+const STRONG_LISTICLE_TITLE_RE = /\b(top\s+\d+|best\s+\d+|\d+\s+(?:best|top|biggest|hottest|upcoming)|list\s+of|roundup|round-up|things\s+to\s+do|events?\s+this\s+(?:week|month|year))\b/i;
+
+function hasSingleEventIdentifier(text: string): boolean {
+  // Single-event identifier: explicit registration verb + a date-ish token nearby
+  const hasReg = /\b(register|rsvp|get\s+tickets?|reserve|sign\s+up|book\s+now)\b/i.test(text);
+  const hasDateish = /\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/i.test(text);
+  return hasReg && hasDateish;
+}
+
 function isListArticle(title: string, text: string): boolean {
-  // Hard reject by title pattern
+  // 1) Strong title-pattern reject (high precision, low false-positive)
+  if (STRONG_LISTICLE_TITLE_RE.test(title)) return true;
   for (const pat of LISTICLE_TITLE_PATTERNS) {
     if (pat.test(title)) return true;
   }
   const lowerTitle = title.toLowerCase();
+  // 2) Title starts with classic listicle phrase
   for (const phrase of LIST_ARTICLE_PHRASES) {
-    if (lowerTitle.startsWith(phrase) || lowerTitle.includes(` ${phrase}`)) return true;
+    if (lowerTitle.startsWith(phrase)) return true;
   }
-  // Body check — need 2+ phrase hits
-  const lower = text.toLowerCase().substring(0, 800);
+  // 3) Body check — only if no single-event identifier present, require ≥3 phrase hits (was 2 — too aggressive)
+  if (hasSingleEventIdentifier(text)) return false;
+  const lower = text.toLowerCase().substring(0, 1200);
   let matches = 0;
   for (const phrase of LIST_ARTICLE_PHRASES) {
     if (lower.includes(phrase)) matches++;
-    if (matches >= 2) return true;
+    if (matches >= 3) return true;
   }
   return false;
 }
