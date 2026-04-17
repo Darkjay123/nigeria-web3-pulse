@@ -536,6 +536,17 @@ async function isDuplicateEvent(
         if (titleSimilarity(title, ev.title) > 0.7) return true;
       }
     }
+  } else {
+    // 4) Cross-platform fallback (no date) — strict similarity threshold
+    const { data: noDateCandidates } = await supabase
+      .from('events')
+      .select('id, title')
+      .limit(200);
+    if (noDateCandidates) {
+      for (const ev of noDateCandidates) {
+        if (titleSimilarity(title, ev.title) > 0.85) return true;
+      }
+    }
   }
 
   return false;
