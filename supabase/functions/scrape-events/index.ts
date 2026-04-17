@@ -390,18 +390,28 @@ function computeConfidence(event: any): number {
 function normalizeTitle(title: string): string {
   return title
     .toLowerCase()
-    .replace(/tickets?/gi, '')
-    .replace(/[-_]/g, ' ')
-    .replace(/\s+/g, ' ')
+    .replace(/\b(?:tickets?|register\s*now|rsvp|free\s+entry|book\s+now|sign\s*up)\b/gi, '')
+    .replace(/[-_|·•]/g, ' ')
     .replace(/[^a-z0-9 ]/g, '')
+    .replace(/\s+/g, ' ')
     .trim();
+}
+
+function normalizeUrl(url: string | null | undefined): string | null {
+  if (!url) return null;
+  try {
+    const u = new URL(url);
+    const path = u.pathname.replace(/\/$/, '');
+    return `${u.hostname.toLowerCase()}${path}`;
+  } catch {
+    return url.toLowerCase().split('?')[0].replace(/\/$/, '');
+  }
 }
 
 function titleSimilarity(a: string, b: string): number {
   const na = normalizeTitle(a);
   const nb = normalizeTitle(b);
   if (na === nb) return 1.0;
-  // Simple token overlap similarity
   const tokensA = new Set(na.split(' ').filter(t => t.length > 2));
   const tokensB = new Set(nb.split(' ').filter(t => t.length > 2));
   if (tokensA.size === 0 || tokensB.size === 0) return 0;
@@ -420,35 +430,39 @@ async function generateDedupHash(title: string, date: string | null, state: stri
 }
 
 async function isDuplicateEvent(
-  title: string, date: string | null, link: string | null,
+  title: string, date: string | null, link: string | null, sourceUrl: string | null,
   dedupHash: string, supabase: any
 ): Promise<boolean> {
-  // Check exact hash
+  // 1) Exact hash
   const { data: exactMatch } = await supabase
     .from('events')
-    .select('id, title')
+    .select('id')
     .eq('dedup_hash', dedupHash)
     .maybeSingle();
   if (exactMatch) return true;
 
-  // Check same registration link
-  if (link) {
-    const { data: linkMatch } = await supabase
+  // 2) Same normalized link (registration_link OR source_url)
+  const candidates = Array.from(new Set([normalizeUrl(link), normalizeUrl(sourceUrl)].filter(Boolean) as string[]));
+  for (const norm of candidates) {
+    const { data: linkMatches } = await supabase
       .from('events')
-      .select('id')
-      .eq('registration_link', link)
-      .maybeSingle();
-    if (linkMatch) return true;
+      .select('id, registration_link, source_url')
+      .or(`registration_link.ilike.%${norm}%,source_url.ilike.%${norm}%`)
+      .limit(10);
+    if (linkMatches) {
+      for (const m of linkMatches) {
+        if (normalizeUrl(m.registration_link) === norm || normalizeUrl(m.source_url) === norm) return true;
+      }
+    }
   }
 
-  // Fuzzy title match: check recent events with same date
+  // 3) Fuzzy title match on same date
   if (date) {
     const { data: sameDateEvents } = await supabase
       .from('events')
       .select('id, title')
       .eq('event_date', date)
       .limit(50);
-
     if (sameDateEvents) {
       for (const ev of sameDateEvents) {
         if (titleSimilarity(title, ev.title) > 0.7) return true;
