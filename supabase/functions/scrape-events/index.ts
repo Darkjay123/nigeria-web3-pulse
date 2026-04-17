@@ -94,6 +94,22 @@ const LIST_ARTICLE_PHRASES = [
   "read more", "related articles", "you might also like",
   "table of contents", "written by", "published on",
   "share this", "comments section",
+  "things to do", "events this week", "we've compiled", "we have compiled",
+  "roundup", "round-up", "ultimate guide", "complete guide",
+  "discover the", "explore the", "check out these", "check out the",
+  "top 5", "top 10", "top 20", "best of", "must attend", "must-attend",
+];
+
+// Title-only blacklist patterns (listicle / blog signals)
+const LISTICLE_TITLE_PATTERNS = [
+  /^\s*top\s+\d+/i,
+  /^\s*best\s+\d+/i,
+  /^\s*\d+\s+(?:best|top|biggest|hottest|upcoming)/i,
+  /^\s*(?:the\s+)?ultimate\s+guide/i,
+  /^\s*(?:the\s+)?complete\s+guide/i,
+  /\broundup\b/i,
+  /\bevents?\s+this\s+(?:week|month|year)\b/i,
+  /\bthings\s+to\s+do\b/i,
 ];
 
 const EVENT_STRUCTURE_SIGNALS = [
@@ -117,46 +133,58 @@ function isAllowedDomain(url: string): "allowed" | "blocked" | "unknown" {
   }
 }
 
-function isListArticle(text: string): boolean {
-  const lower = text.toLowerCase().substring(0, 500);
+function isListArticle(title: string, text: string): boolean {
+  // Hard reject by title pattern
+  for (const pat of LISTICLE_TITLE_PATTERNS) {
+    if (pat.test(title)) return true;
+  }
+  const lowerTitle = title.toLowerCase();
+  for (const phrase of LIST_ARTICLE_PHRASES) {
+    if (lowerTitle.startsWith(phrase) || lowerTitle.includes(` ${phrase}`)) return true;
+  }
+  // Body check — need 2+ phrase hits
+  const lower = text.toLowerCase().substring(0, 800);
   let matches = 0;
   for (const phrase of LIST_ARTICLE_PHRASES) {
     if (lower.includes(phrase)) matches++;
+    if (matches >= 2) return true;
   }
-  return matches >= 2;
+  return false;
 }
 
-function hasEventStructure(text: string): { pass: boolean; signals: number } {
+function hasEventStructure(text: string): { pass: boolean; signals: number; hasDate: boolean } {
   const lower = text.toLowerCase();
   let signals = 0;
 
-  // Check for date patterns
-  const hasDate = /\d{4}-\d{2}-\d{2}/.test(text) ||
-    /\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/i.test(text) ||
-    /(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}/i.test(text) ||
-    /(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i.test(text);
+  // Specific date: ISO, "12 Jan 2026", "Jan 12, 2026", etc. — NOT vague "this week"
+  const hasDate = /\b\d{4}-\d{2}-\d{2}\b/.test(text) ||
+    /\b\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}\b/i.test(text) ||
+    /\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}\b/i.test(text);
   if (hasDate) signals++;
 
-  // Check for time
-  const hasTime = /\d{1,2}:\d{2}\s*(?:am|pm|AM|PM)?/.test(text) ||
-    /\d{1,2}\s*(?:am|pm|AM|PM)/.test(text);
+  // Specific time
+  const hasTime = /\b\d{1,2}:\d{2}\s*(?:am|pm|AM|PM)?\b/.test(text) ||
+    /\b\d{1,2}\s*(?:am|pm|AM|PM)\b/.test(text);
   if (hasTime) signals++;
 
-  // Check for registration/RSVP language
+  // Registration / RSVP language
   for (const sig of EVENT_STRUCTURE_SIGNALS) {
     if (lower.includes(sig)) { signals++; break; }
   }
 
-  // Check for venue/location
-  const hasVenue = /venue|location|address|hall|center|centre|hotel|hub|space/i.test(text);
-  if (hasVenue) signals++;
+  // Venue/location or explicit "online event"
+  const hasLocation = /\b(?:venue|location|address|hall|center|centre|hotel|hub|space|online event|virtual event)\b/i.test(text);
+  if (hasLocation) signals++;
 
-  return { pass: signals >= 2, signals };
+  return { pass: signals >= 2, signals, hasDate };
 }
 
 /**
- * PAGE TYPE GATE: Returns true if the event candidate should proceed to AI.
- * Returns false (with reason) if it should be rejected.
+ * PAGE TYPE GATE (Stage 1 — Hard Filters, deterministic):
+ * - Domain filter
+ * - Listicle / blog detection (title + body)
+ * - Event structure (≥2 signals)
+ * - MUST have a real date signal
  */
 function pageTypeGate(raw: { title: string; description?: string; source_url?: string }): { pass: boolean; reason: string } {
   const url = raw.source_url || "";
@@ -168,24 +196,20 @@ function pageTypeGate(raw: { title: string; description?: string; source_url?: s
     return { pass: false, reason: `blocked domain: ${url}` };
   }
 
-  // B) Content rejection — list/article detection
-  if (isListArticle(fullText)) {
-    return { pass: false, reason: "list/article content detected" };
+  // B) Listicle / blog detection
+  if (isListArticle(raw.title, fullText)) {
+    return { pass: false, reason: "listicle/blog content detected" };
   }
 
-  // C) For unknown domains, require event structure
-  if (domainStatus === "unknown") {
-    const structure = hasEventStructure(fullText);
-    if (!structure.pass) {
-      return { pass: false, reason: `unknown domain, weak event structure (signals=${structure.signals})` };
-    }
+  // C) Structure check (mandatory for unknown domains, recommended for all)
+  const structure = hasEventStructure(fullText);
+  if (domainStatus === "unknown" && !structure.pass) {
+    return { pass: false, reason: `unknown domain, weak event structure (signals=${structure.signals})` };
   }
 
-  // D) Must have SOME date signal (hard reject if no date at all)
-  const hasAnyDate = /\d{4}|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b|(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i.test(fullText);
-  // Only enforce for non-event-platform sources
-  if (domainStatus !== "allowed" && !hasAnyDate) {
-    return { pass: false, reason: "no date signal found" };
+  // D) Hard reject if no specific date — except for whitelisted platforms where date may live in metadata
+  if (domainStatus !== "allowed" && !structure.hasDate) {
+    return { pass: false, reason: "no specific date found" };
   }
 
   return { pass: true, reason: "ok" };
@@ -196,44 +220,73 @@ function pageTypeGate(raw: { title: string; description?: string; source_url?: s
 const AI_GATEWAY_URL = "https://ai.gateway.lovable.dev/v1/chat/completions";
 
 interface AIClassification {
-  relevant: boolean;
+  is_event: boolean;
+  is_listicle: boolean;
   event_type: string;
-  tags: string[];
-  state: string;
-  city: string | null;
-  event_date: string | null;
-  confidence_score: number;
+  has_real_date: boolean;
+  has_location: boolean;
+  has_registration: boolean;
+  is_online: boolean;
+  confidence: number;
+  reason: string;
+  event_date?: string | null;
+  state?: string | null;
+  city?: string | null;
+  tags?: string[];
 }
 
 async function classifyWithAI(
-  event: { title: string; description?: string; venue?: string; city?: string },
+  event: { title: string; description?: string; venue?: string; city?: string; source_url?: string },
   apiKey: string
 ): Promise<AIClassification | null> {
-  const prompt = `You are a strict Web3 event classifier. Analyze this event and determine if it is genuinely about Web3/blockchain/crypto.
+  const userPrompt = `Analyze the following content and return STRICT JSON via the classify_event tool.
 
-EVENT:
+Reject if:
+- It is a blog post, news article, or general article
+- It is a listicle / list of multiple events ("Top 10...", "Best events...", roundups)
+- It does not describe ONE specific event with a real date
+- Web3/blockchain/crypto is not the CORE topic
+
+Accept ONLY if:
+- It describes ONE specific event
+- Has a clear specific date (not "this week" / "soon")
+- Has a clear physical location OR is explicitly online
+- Has a registration / participation method
+- Web3 / blockchain / crypto / DeFi / NFT / DAO is the CORE topic
+
+CONTENT:
 Title: ${event.title}
-Description: ${(event.description || "").substring(0, 800)}
+URL: ${event.source_url || "N/A"}
 Venue: ${event.venue || "N/A"}
 City: ${event.city || "N/A"}
+Description: ${(event.description || "").substring(0, 1500)}`;
 
-RULES:
-- ONLY mark relevant=true if Web3/blockchain/crypto is the CORE focus
-- Reject generic tech events (AI, SaaS, design, product) unless Web3 is central
-- Reject events with weak/passing crypto mentions
-- Reject news articles, blog posts, lists, or non-event pages
-- Accept niche deep Web3 topics (ZK, MEV, account abstraction, etc.)
-
-Respond with a JSON object using this exact structure:
-{
-  "relevant": boolean,
-  "event_type": "meetup"|"hackathon"|"workshop"|"conference"|"ama"|"online_session"|"bootcamp"|"summit"|"webinar"|"other",
-  "tags": string[] (from: defi, nft, dao, zk, layer2, trading, security, identity, gaming, ai+crypto, stablecoin, regulation, smart_contracts, infrastructure, community, education),
-  "state": string (Nigerian state name or "Online"),
-  "city": string or null,
-  "event_date": "YYYY-MM-DD" or null,
-  "confidence_score": number 0.0-1.0
-}`;
+  const tools = [{
+    type: "function",
+    function: {
+      name: "classify_event",
+      description: "Classify whether the content is a single, specific Web3 event.",
+      parameters: {
+        type: "object",
+        properties: {
+          is_event: { type: "boolean", description: "True only if this is ONE specific event (not a list, blog, or article)" },
+          is_listicle: { type: "boolean", description: "True if this is a list of multiple events, blog post, or article" },
+          event_type: { type: "string", enum: ["meetup", "hackathon", "workshop", "conference", "ama", "online_session", "bootcamp", "summit", "webinar", "other"] },
+          has_real_date: { type: "boolean", description: "True only if a SPECIFIC calendar date is present (not vague)" },
+          has_location: { type: "boolean", description: "True if a physical venue/city is present" },
+          has_registration: { type: "boolean", description: "True if registration/RSVP/ticket link or method exists" },
+          is_online: { type: "boolean", description: "True if the event is explicitly online/virtual" },
+          confidence: { type: "number", description: "0.0-1.0 confidence this is a real, specific Web3 event" },
+          reason: { type: "string", description: "Short explanation (max 120 chars)" },
+          event_date: { type: ["string", "null"], description: "YYYY-MM-DD if extractable, else null" },
+          state: { type: ["string", "null"], description: "Nigerian state name or 'Online'" },
+          city: { type: ["string", "null"] },
+          tags: { type: "array", items: { type: "string" } },
+        },
+        required: ["is_event", "is_listicle", "event_type", "has_real_date", "has_location", "has_registration", "is_online", "confidence", "reason"],
+      },
+    },
+  }];
 
   try {
     const resp = await fetch(AI_GATEWAY_URL, {
@@ -243,26 +296,29 @@ Respond with a JSON object using this exact structure:
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "google/gemini-2.5-flash-lite",
+        model: "google/gemini-2.5-flash",
         messages: [
-          { role: "system", content: "You are a strict Web3 event classifier. Output ONLY valid JSON, no markdown." },
-          { role: "user", content: prompt },
+          { role: "system", content: "You are an event classification engine. Be strict. Reject anything that is not a single, specific Web3 event. Bias toward rejection when in doubt." },
+          { role: "user", content: userPrompt },
         ],
-        temperature: 0.1,
+        tools,
+        tool_choice: { type: "function", function: { name: "classify_event" } },
+        temperature: 0.0,
       }),
     });
 
     if (!resp.ok) {
-      console.error(`[AI] Classification failed: ${resp.status}`);
+      console.error(`[AI] Classification failed: ${resp.status} ${await resp.text().catch(() => "")}`);
       return null;
     }
 
     const data = await resp.json();
-    const content = data.choices?.[0]?.message?.content?.trim();
-    if (!content) return null;
-
-    const jsonStr = content.replace(/^```json?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
-    return JSON.parse(jsonStr) as AIClassification;
+    const toolCall = data.choices?.[0]?.message?.tool_calls?.[0];
+    if (!toolCall?.function?.arguments) {
+      console.error('[AI] No tool call in response');
+      return null;
+    }
+    return JSON.parse(toolCall.function.arguments) as AIClassification;
   } catch (e) {
     console.error('[AI] Classification error:', e);
     return null;
@@ -334,18 +390,28 @@ function computeConfidence(event: any): number {
 function normalizeTitle(title: string): string {
   return title
     .toLowerCase()
-    .replace(/tickets?/gi, '')
-    .replace(/[-_]/g, ' ')
-    .replace(/\s+/g, ' ')
+    .replace(/\b(?:tickets?|register\s*now|rsvp|free\s+entry|book\s+now|sign\s*up)\b/gi, '')
+    .replace(/[-_|·•]/g, ' ')
     .replace(/[^a-z0-9 ]/g, '')
+    .replace(/\s+/g, ' ')
     .trim();
+}
+
+function normalizeUrl(url: string | null | undefined): string | null {
+  if (!url) return null;
+  try {
+    const u = new URL(url);
+    const path = u.pathname.replace(/\/$/, '');
+    return `${u.hostname.toLowerCase()}${path}`;
+  } catch {
+    return url.toLowerCase().split('?')[0].replace(/\/$/, '');
+  }
 }
 
 function titleSimilarity(a: string, b: string): number {
   const na = normalizeTitle(a);
   const nb = normalizeTitle(b);
   if (na === nb) return 1.0;
-  // Simple token overlap similarity
   const tokensA = new Set(na.split(' ').filter(t => t.length > 2));
   const tokensB = new Set(nb.split(' ').filter(t => t.length > 2));
   if (tokensA.size === 0 || tokensB.size === 0) return 0;
@@ -364,35 +430,39 @@ async function generateDedupHash(title: string, date: string | null, state: stri
 }
 
 async function isDuplicateEvent(
-  title: string, date: string | null, link: string | null,
+  title: string, date: string | null, link: string | null, sourceUrl: string | null,
   dedupHash: string, supabase: any
 ): Promise<boolean> {
-  // Check exact hash
+  // 1) Exact hash
   const { data: exactMatch } = await supabase
     .from('events')
-    .select('id, title')
+    .select('id')
     .eq('dedup_hash', dedupHash)
     .maybeSingle();
   if (exactMatch) return true;
 
-  // Check same registration link
-  if (link) {
-    const { data: linkMatch } = await supabase
+  // 2) Same normalized link (registration_link OR source_url)
+  const candidates = Array.from(new Set([normalizeUrl(link), normalizeUrl(sourceUrl)].filter(Boolean) as string[]));
+  for (const norm of candidates) {
+    const { data: linkMatches } = await supabase
       .from('events')
-      .select('id')
-      .eq('registration_link', link)
-      .maybeSingle();
-    if (linkMatch) return true;
+      .select('id, registration_link, source_url')
+      .or(`registration_link.ilike.%${norm}%,source_url.ilike.%${norm}%`)
+      .limit(10);
+    if (linkMatches) {
+      for (const m of linkMatches) {
+        if (normalizeUrl(m.registration_link) === norm || normalizeUrl(m.source_url) === norm) return true;
+      }
+    }
   }
 
-  // Fuzzy title match: check recent events with same date
+  // 3) Fuzzy title match on same date
   if (date) {
     const { data: sameDateEvents } = await supabase
       .from('events')
       .select('id, title')
       .eq('event_date', date)
       .limit(50);
-
     if (sameDateEvents) {
       for (const ev of sameDateEvents) {
         if (titleSimilarity(title, ev.title) > 0.7) return true;
@@ -520,15 +590,9 @@ async function scrapeLumaEvents(): Promise<any[]> {
       const resp = await fetch(url, { headers: { 'Accept': 'application/json' } });
 
       if (!resp.ok) {
-        const htmlResp = await fetch(`https://lu.ma/discover?query=${query}`);
-        if (htmlResp.ok) {
-          const html = await htmlResp.text();
-          const titleMatches = html.matchAll(/<h[1-3][^>]*>([^<]{10,100})<\/h[1-3]>/gi);
-          for (const m of titleMatches) {
-            const title = m[1].trim();
-            if (title.length > 10) events.push({ title, source_platform: "luma" });
-          }
-        }
+        // No HTML fallback — the section-headings it scraped were noise that wasted the pipeline.
+        // If the Luma JSON API fails, skip this query entirely.
+        console.warn(`[Luma] API failed for "${query}" (${resp.status}), skipping`);
         continue;
       }
 
@@ -688,38 +752,53 @@ async function processEvent(
     return false;
   }
 
-  // STAGE 2: AI classification
-  let aiResult: AIClassification | null = null;
-  if (lovableApiKey) {
-    aiResult = await classifyWithAI(
-      { title: raw.title, description: raw.description, venue: raw.venue, city: raw.city },
-      lovableApiKey
-    );
+  // STAGE 2: AI classification (STRICT — confidence >= 0.85, all signals required)
+  if (!lovableApiKey) {
+    stats.filtered_ai++;
+    console.log(`[AI SKIP-REJECT] "${raw.title}" — no AI key configured`);
+    return false;
   }
 
-  if (aiResult) {
-    if (!aiResult.relevant || aiResult.confidence_score < 0.5) {
-      stats.filtered_ai++;
-      console.log(`[AI REJECT] "${raw.title}" (relevant=${aiResult.relevant}, confidence=${aiResult.confidence_score})`);
-      return false;
-    }
-    console.log(`[AI ACCEPT] "${raw.title}" (confidence=${aiResult.confidence_score})`);
+  const aiResult = await classifyWithAI(
+    { title: raw.title, description: raw.description, venue: raw.venue, city: raw.city, source_url: raw.source_url },
+    lovableApiKey
+  );
+
+  if (!aiResult) {
+    stats.filtered_ai++;
+    console.log(`[AI REJECT] "${raw.title}" — classifier failed`);
+    return false;
   }
 
-  // Build event record
-  const state = aiResult?.state || detectState(fullText);
-  const eventType = aiResult?.event_type || detectEventType(fullText);
-  const isOnline = state === "Online" || raw.is_online || detectIsOnline(fullText);
-  const eventDate = aiResult?.event_date || raw.event_date || extractDate(fullText);
-  const city = aiResult?.city || raw.city || null;
-  const tags = aiResult?.tags || [];
-  const confidenceScore = aiResult?.confidence_score || computeConfidence({ ...raw, state, event_date: eventDate });
+  const acceptedByAI =
+    aiResult.is_event === true &&
+    aiResult.is_listicle === false &&
+    aiResult.has_real_date === true &&
+    (aiResult.has_location === true || aiResult.is_online === true) &&
+    aiResult.has_registration === true &&
+    aiResult.confidence >= 0.85;
 
-  const resolvedState = state === "Unknown" ? (isOnline ? "Online" : "Lagos") : state;
+  if (!acceptedByAI) {
+    stats.filtered_ai++;
+    console.log(`[AI REJECT] "${raw.title}" — confidence=${aiResult.confidence} reason="${aiResult.reason}" event=${aiResult.is_event} listicle=${aiResult.is_listicle} date=${aiResult.has_real_date} loc=${aiResult.has_location} reg=${aiResult.has_registration}`);
+    return false;
+  }
+  console.log(`[AI ACCEPT] "${raw.title}" (confidence=${aiResult.confidence})`);
+
+  // Build event record from AI + raw
+  const state = aiResult.state || detectState(fullText);
+  const eventType = aiResult.event_type || detectEventType(fullText);
+  const isOnline = state === "Online" || aiResult.is_online || raw.is_online || detectIsOnline(fullText);
+  const eventDate = aiResult.event_date || raw.event_date || extractDate(fullText);
+  const city = aiResult.city || raw.city || null;
+  const tags = aiResult.tags || [];
+  const confidenceScore = aiResult.confidence;
+
+  const resolvedState = !state || state === "Unknown" ? (isOnline ? "Online" : "Lagos") : state;
   const dedupHash = await generateDedupHash(raw.title, eventDate, resolvedState);
 
   // STAGE 3: Improved dedup
-  const isDupe = await isDuplicateEvent(raw.title, eventDate, raw.registration_link, dedupHash, supabase);
+  const isDupe = await isDuplicateEvent(raw.title, eventDate, raw.registration_link, raw.source_url, dedupHash, supabase);
   if (isDupe) {
     stats.duplicates++;
     return false;
