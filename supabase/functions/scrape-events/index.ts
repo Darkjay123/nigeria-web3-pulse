@@ -352,22 +352,27 @@ interface AIClassification {
 
 async function classifyWithAI(
   event: { title: string; description?: string; venue?: string; city?: string; source_url?: string },
-  apiKey: string
+  apiKey: string,
+  sourceType: "structured" | "discovery" = "structured",
 ): Promise<AIClassification | null> {
+  const modeRules = sourceType === "discovery"
+    ? `MODE: DISCOVERY (social post / tweet)
+Accept if it ANNOUNCES ONE specific upcoming Web3 event (meetup, hackathon, AMA, twitter space, workshop).
+A vague time like "this Saturday", "tomorrow", "next week" is acceptable IF the event itself is concrete.
+Reject if it is general commentary, a thread, news, or a promotional brand post with no specific event.
+Extract event_date as YYYY-MM-DD if you can resolve the relative time vs today.`
+    : `MODE: STRUCTURED (Eventbrite / Luma / Meetup / event page)
+Accept ONLY if it describes ONE specific event with a clear specific date, a location (or explicitly online), and a registration method.
+Reject blog posts, listicles ("Top 10..."), news articles, or generic pages.`;
+
   const userPrompt = `Analyze the following content and return STRICT JSON via the classify_event tool.
 
-Reject if:
-- It is a blog post, news article, or general article
-- It is a listicle / list of multiple events ("Top 10...", "Best events...", roundups)
-- It does not describe ONE specific event with a real date
-- Web3/blockchain/crypto is not the CORE topic
+${modeRules}
 
-Accept ONLY if:
-- It describes ONE specific event
-- Has a clear specific date (not "this week" / "soon")
-- Has a clear physical location OR is explicitly online
-- Has a registration / participation method
-- Web3 / blockchain / crypto / DeFi / NFT / DAO is the CORE topic
+Common rejects (BOTH MODES):
+- Listicles / roundups / "best of" articles
+- Blog posts, news articles
+- Web3 / blockchain / crypto / DeFi / NFT / DAO must be the CORE topic — not a side mention
 
 CONTENT:
 Title: ${event.title}
