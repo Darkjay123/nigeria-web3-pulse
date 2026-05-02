@@ -217,7 +217,37 @@ interface NormalizedEvent {
   organizer: string | null;
   is_online: boolean;
   has_metadata_date: boolean;       // true if date came from API/JSON-LD, not text
+  source_type: "structured" | "discovery"; // routes through different gate rules
+  has_time_signal: boolean;         // includes vague time words for discovery mode
   _submission_count?: number;
+}
+
+// Relative time words — only honored in DISCOVERY mode (X, Reddit, Discord)
+const RELATIVE_TIME_WORDS = [
+  "today", "tomorrow", "tonight",
+  "this weekend", "this week", "this saturday", "this sunday",
+  "this monday", "this tuesday", "this wednesday", "this thursday", "this friday",
+  "next week", "next weekend",
+  "next monday", "next tuesday", "next wednesday", "next thursday",
+  "next friday", "next saturday", "next sunday",
+];
+
+function containsTimeWords(text: string): boolean {
+  const lower = text.toLowerCase();
+  for (const w of RELATIVE_TIME_WORDS) {
+    if (lower.includes(w)) return true;
+  }
+  // also bare weekday near "join us" / "happening"
+  if (/\b(?:happening|join\s+us|live|going\s+down)\b.{0,40}\b(?:mon|tue|wed|thu|fri|sat|sun)/i.test(text)) return true;
+  return false;
+}
+
+const STRUCTURED_PLATFORMS = new Set(["luma", "eventbrite", "meetup", "partiful", "community"]);
+const DISCOVERY_PLATFORMS = new Set(["x", "x_discovery", "twitter", "reddit", "discord"]);
+
+function classifySource(platform: string): "structured" | "discovery" {
+  if (DISCOVERY_PLATFORMS.has(platform)) return "discovery";
+  return "structured";
 }
 
 function normalizeEvent(raw: any): NormalizedEvent {
