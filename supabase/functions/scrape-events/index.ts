@@ -1098,11 +1098,16 @@ Deno.serve(async () => {
       ...xTweetEvents.map(e => ({ ...e, _source: 'x' as const })),
     ];
 
-    console.log(`Total raw candidates: ${allRaw.length} (max 30 will be processed)`);
+    console.log(`Total raw candidates: ${allRaw.length} (max 50 will be processed)`);
+
+    // Source breakdown logging
+    const sourceBreakdown: Record<string, number> = {};
+    for (const r of allRaw) sourceBreakdown[r._source] = (sourceBreakdown[r._source] || 0) + 1;
+    console.log(`[BREAKDOWN raw] ${JSON.stringify(sourceBreakdown)}`);
 
     let processed = 0;
     for (const raw of allRaw) {
-      if (processed >= 30) break; // Cap per run for performance
+      if (processed >= 50) break; // Cap per run
       try {
         await processEvent(raw, raw._source, supabase, lovableApiKey, results[raw._source]);
         processed++;
