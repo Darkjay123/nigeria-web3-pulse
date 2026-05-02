@@ -965,7 +965,8 @@ async function processEvent(
 
   const aiResult = await classifyWithAI(
     { title: ev.title, description: ev.description, venue: ev.venue || undefined, city: ev.city || undefined, source_url: ev.source_url || undefined },
-    lovableApiKey
+    lovableApiKey,
+    ev.source_type,
   );
 
   if (!aiResult) {
