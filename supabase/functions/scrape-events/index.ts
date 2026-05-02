@@ -942,11 +942,12 @@ async function processEvent(
     return false;
   }
 
-  // STAGE 2: Web3 keyword pre-filter
+  // STAGE 2: Web3 keyword pre-filter (source-aware threshold)
   const kwScore = web3KeywordScore(fullText);
-  if (kwScore < 2) {
+  const kwThreshold = ev.source_type === "discovery" ? 1 : 2;
+  if (kwScore < kwThreshold) {
     stats.filtered_keyword++;
-    console.log(`[KEYWORD REJECT] "${ev.title}" (score=${kwScore})`);
+    console.log(`[KEYWORD REJECT] "${ev.title}" (score=${kwScore}, need=${kwThreshold}, mode=${ev.source_type})`);
     return false;
   }
 
