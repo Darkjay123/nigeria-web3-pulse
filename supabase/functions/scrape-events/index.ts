@@ -88,7 +88,7 @@ const BLOCKED_DOMAINS = [
 ];
 
 const LIST_ARTICLE_PHRASES = [
-  "top ", "best ", "list of", "in this article", "here are",
+  "list of", "in this article", "here are",
   "upcoming events in", "about us", "our team", "privacy policy",
   "terms of service", "cookie policy", "subscribe to", "sign up for our",
   "read more", "related articles", "you might also like",
@@ -96,8 +96,7 @@ const LIST_ARTICLE_PHRASES = [
   "share this", "comments section",
   "things to do", "events this week", "we've compiled", "we have compiled",
   "roundup", "round-up", "ultimate guide", "complete guide",
-  "discover the", "explore the", "check out these", "check out the",
-  "top 5", "top 10", "top 20", "best of", "must attend", "must-attend",
+  "check out these", "must attend", "must-attend",
 ];
 
 // Title-only blacklist patterns (listicle / blog signals)
