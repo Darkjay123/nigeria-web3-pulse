@@ -257,13 +257,14 @@ function normalizeEvent(raw: any): NormalizedEvent {
 
   const metaDate = raw.event_date || raw.metadata?.event_date || null;
   const textDate = !metaDate ? extractDate(fullText) : null;
+  const platform = (raw.source_platform || raw._source || "unknown").toString().toLowerCase();
 
   return {
     title,
     description,
     source_url: raw.source_url || null,
     registration_link: raw.registration_link || raw.source_url || null,
-    source_platform: raw.source_platform || "unknown",
+    source_platform: platform,
     venue: raw.venue || null,
     city: raw.city || null,
     event_date: metaDate || textDate,
@@ -272,45 +273,62 @@ function normalizeEvent(raw: any): NormalizedEvent {
     organizer: raw.organizer || null,
     is_online: !!raw.is_online || detectIsOnline(fullText),
     has_metadata_date: !!metaDate,
+    source_type: classifySource(platform),
+    has_time_signal: !!metaDate || !!textDate || containsTimeWords(fullText),
     _submission_count: raw._submission_count,
   };
 }
 
 /**
- * PAGE TYPE GATE (Stage 1 — Hard Filters, deterministic, METADATA-AWARE):
- * - Domain filter
- * - Listicle / blog detection (title + body)
- * - Event structure (≥2 signals)
- * - Date requirement: satisfied by EITHER text-date OR metadata date (fixes Luma false-rejects)
+ * PAGE TYPE GATE v8 — SOURCE-AWARE.
+ *
+ * STRUCTURED MODE (Eventbrite, Luma, Meetup, community):
+ *   - Domain check + listicle reject + ≥2 structure signals + real date (text/meta)
+ *
+ * DISCOVERY MODE (X, Reddit, Discord):
+ *   - Title-level listicle reject only
+ *   - Require ANY time signal (specific OR vague: "this Saturday")
+ *   - Web3 relevance enforced in Stage 2; structural rules left to AI
  */
 function pageTypeGate(ev: NormalizedEvent): { pass: boolean; reason: string } {
   const url = ev.source_url || "";
   const fullText = `${ev.title} ${ev.description}`;
 
-  // A) Domain check
-  const domainStatus = isAllowedDomain(url);
-  if (domainStatus === "blocked") {
-    return { pass: false, reason: `blocked domain: ${url}` };
+  // Title-level listicle reject — applies to BOTH modes
+  if (STRONG_LISTICLE_TITLE_RE.test(ev.title)) {
+    return { pass: false, reason: "listicle title pattern" };
+  }
+  for (const pat of LISTICLE_TITLE_PATTERNS) {
+    if (pat.test(ev.title)) return { pass: false, reason: "listicle title pattern" };
   }
 
-  // B) Listicle / blog detection
+  if (ev.source_type === "discovery") {
+    if (ev.title.length < 10) return { pass: false, reason: "discovery: title too short" };
+    if (!ev.has_time_signal) {
+      return { pass: false, reason: "discovery: no time signal (specific or relative)" };
+    }
+    return { pass: true, reason: "ok (discovery)" };
+  }
+
+  // STRUCTURED
+  const domainStatus = isAllowedDomain(url);
+  if (domainStatus === "blocked") return { pass: false, reason: `blocked domain: ${url}` };
+
   if (isListArticle(ev.title, fullText)) {
     return { pass: false, reason: "listicle/blog content detected" };
   }
 
-  // C) Structure check
   const structure = hasEventStructure(fullText);
   if (domainStatus === "unknown" && !structure.pass) {
     return { pass: false, reason: `unknown domain, weak event structure (signals=${structure.signals})` };
   }
 
-  // D) Date requirement — metadata-aware (FIX: previously rejected valid Luma events)
   const hasValidDate = structure.hasDate || ev.has_metadata_date || !!ev.event_date;
   if (domainStatus !== "allowed" && !hasValidDate) {
     return { pass: false, reason: "no specific date found (text or metadata)" };
   }
 
-  return { pass: true, reason: "ok" };
+  return { pass: true, reason: "ok (structured)" };
 }
 
 // ============ AI CLASSIFICATION ============
