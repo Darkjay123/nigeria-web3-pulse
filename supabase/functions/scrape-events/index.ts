@@ -863,6 +863,15 @@ function finalValidate(ev: NormalizedEvent, ai: AIClassification): { ok: boolean
   if (ai.confidence < 0.85) return { ok: false, reason: `AI: low confidence ${ai.confidence}` };
 
   const eventDate = ai.event_date || ev.event_date;
+
+  if (ev.source_type === "discovery") {
+    // For X-style sources: AI confidence + event intent are enough.
+    // A vague time signal already passed Stage 1; AI extracted what it could.
+    // Allow null event_date — we will store the post itself.
+    return { ok: true, reason: "ok (discovery)" };
+  }
+
+  // STRUCTURED — strict
   if (!eventDate) return { ok: false, reason: "no resolvable date (text+metadata+AI all empty)" };
 
   const isOnline = ai.is_online || ev.is_online;
@@ -872,7 +881,7 @@ function finalValidate(ev: NormalizedEvent, ai: AIClassification): { ok: boolean
   const hasRegistration = !!ev.registration_link || !!ev.source_url || ai.has_registration;
   if (!hasRegistration) return { ok: false, reason: "no registration link" };
 
-  return { ok: true, reason: "ok" };
+  return { ok: true, reason: "ok (structured)" };
 }
 
 async function processEvent(
