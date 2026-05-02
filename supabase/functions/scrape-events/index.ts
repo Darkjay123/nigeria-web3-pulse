@@ -1051,10 +1051,11 @@ Deno.serve(async () => {
       luma: emptyStats(),
       eventbrite: emptyStats(),
       meetup: emptyStats(),
-      x_discovery: emptyStats(),
+      x: emptyStats(),                // tweet-native (discovery mode)
+      x_discovery: emptyStats(),      // outbound links enriched (structured mode)
     };
 
-    // ---- Phase 1: Scrape platforms in parallel ----
+    // ---- Phase 1: Scrape structured platforms in parallel ----
     const [lumaEvents, eventbriteEvents, meetupEvents] = await Promise.all([
       scrapeLumaEvents().catch(e => { results.luma.errors = String(e); return []; }),
       scrapeEventbriteEvents().catch(e => { results.eventbrite.errors = String(e); return []; }),
@@ -1065,15 +1066,18 @@ Deno.serve(async () => {
     results.eventbrite.found = eventbriteEvents.length;
     results.meetup.found = meetupEvents.length;
 
-    // ---- Phase 1b: X/Twitter discovery → extract event links → enrich with Firecrawl ----
-    let xDiscoveredEvents: any[] = [];
+    // ---- Phase 1b: X/Twitter discovery (DUAL OUTPUT) ----
+    let xDiscoveredEvents: any[] = []; // enriched outbound (structured)
+    let xTweetEvents: any[] = [];      // tweet-native (discovery)
     if (firecrawlApiKey) {
       try {
-        const xLinks = await discoverFromXTwitter(firecrawlApiKey);
-        console.log(`[X Discovery] Found ${xLinks.length} event links from tweets`);
-        results.x_discovery.found = xLinks.length;
+        const { outboundLinks, tweetEvents } = await discoverFromXTwitter(firecrawlApiKey);
+        console.log(`[X Discovery] outbound=${outboundLinks.length} tweetEvents=${tweetEvents.length}`);
+        results.x_discovery.found = outboundLinks.length;
+        results.x.found = tweetEvents.length;
+        xTweetEvents = tweetEvents;
 
-        for (const link of xLinks.slice(0, 10)) {
+        for (const link of outboundLinks.slice(0, 8)) {
           const enriched = await enrichLink(link, firecrawlApiKey);
           if (enriched) {
             enriched.source_platform = "x_discovery";
@@ -1085,12 +1089,13 @@ Deno.serve(async () => {
       }
     }
 
-    // ---- Phase 2: Process all events through pipeline (max 30 per run) ----
+    // ---- Phase 2: Process all events through pipeline ----
     const allRaw = [
       ...lumaEvents.map(e => ({ ...e, _source: 'luma' as const })),
       ...eventbriteEvents.map(e => ({ ...e, _source: 'eventbrite' as const })),
       ...meetupEvents.map(e => ({ ...e, _source: 'meetup' as const })),
       ...xDiscoveredEvents.map(e => ({ ...e, _source: 'x_discovery' as const })),
+      ...xTweetEvents.map(e => ({ ...e, _source: 'x' as const })),
     ];
 
     console.log(`Total raw candidates: ${allRaw.length} (max 30 will be processed)`);
