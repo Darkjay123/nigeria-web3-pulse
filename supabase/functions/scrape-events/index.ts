@@ -651,14 +651,22 @@ async function enrichLink(link: string, firecrawlApiKey: string): Promise<any | 
 }
 
 // ============ X/TWITTER DISCOVERY via Firecrawl search ============
-
-async function discoverFromXTwitter(firecrawlApiKey: string): Promise<string[]> {
-  const links: string[] = [];
+// Returns BOTH:
+//   - outboundLinks: lu.ma/eventbrite/meetup links found inside tweets (enrich → structured)
+//   - tweetEvents:    raw X-native events (the tweet IS the event) → discovery mode
+async function discoverFromXTwitter(firecrawlApiKey: string): Promise<{
+  outboundLinks: string[];
+  tweetEvents: any[];
+}> {
+  const outboundLinks: string[] = [];
+  const tweetEvents: any[] = [];
   const queries = [
-    'site:x.com "web3 event Lagos"',
-    'site:x.com "blockchain meetup Nigeria"',
-    'site:x.com "crypto conference Africa"',
+    'site:x.com "web3 event" Lagos',
+    'site:x.com "blockchain meetup" Nigeria',
+    'site:x.com "crypto meetup" Nigeria',
     'site:x.com "web3 hackathon" Nigeria',
+    'site:x.com "twitter space" web3 Nigeria',
+    'site:x.com web3 workshop Lagos',
   ];
 
   for (const query of queries) {
@@ -670,7 +678,11 @@ async function discoverFromXTwitter(firecrawlApiKey: string): Promise<string[]> 
           "Authorization": `Bearer ${firecrawlApiKey}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ query, limit: 5 }),
+        body: JSON.stringify({
+          query,
+          limit: 6,
+          scrapeOptions: { formats: ["markdown"] },
+        }),
       });
 
       if (!resp.ok) {
@@ -681,14 +693,38 @@ async function discoverFromXTwitter(firecrawlApiKey: string): Promise<string[]> 
       const data = await resp.json();
       const results = data.data || [];
 
-      // Extract links from tweet content
       for (const r of results) {
-        const text = `${r.markdown || ""} ${r.description || ""}`;
-        // Find Luma, Eventbrite, or other event links
-        const urlMatches = text.matchAll(/https?:\/\/(?:lu\.ma|www\.eventbrite\.com|meetup\.com|partiful\.com)[^\s")<\]]+/g);
-        for (const m of urlMatches) {
-          links.push(m[0]);
-        }
+        const tweetUrl: string = r.url || r.metadata?.sourceURL || "";
+        const md: string = r.markdown || r.content || "";
+        const desc: string = r.description || r.metadata?.description || "";
+        const title: string = r.title || r.metadata?.title || "";
+        const text = `${title}\n${desc}\n${md}`.trim();
+
+        if (!tweetUrl.includes("x.com") && !tweetUrl.includes("twitter.com")) continue;
+
+        // 1) Extract outbound event links
+        const urlMatches = text.matchAll(/https?:\/\/(?:lu\.ma|www\.eventbrite\.com|eventbrite\.com|meetup\.com|partiful\.com)[^\s")<\]]+/g);
+        for (const m of urlMatches) outboundLinks.push(m[0]);
+
+        // 2) Build a tweet-native event candidate
+        // Use first non-empty meaningful line as title; full text as description
+        const cleanedTitle = (title || desc.split("\n")[0] || md.split("\n").find(l => l.trim().length > 20) || "").trim().substring(0, 240);
+        if (cleanedTitle.length < 10) continue;
+
+        tweetEvents.push({
+          title: cleanedTitle,
+          description: text.substring(0, 1500),
+          source_url: tweetUrl,
+          registration_link: tweetUrl,
+          source_platform: "x",
+          venue: null,
+          city: null,
+          event_date: null,
+          event_time: null,
+          end_date: null,
+          organizer: null,
+          is_online: /twitter\s+space|x\s+space|virtual|online|zoom|gmeet|google\s+meet/i.test(text),
+        });
       }
 
       await new Promise(r => setTimeout(r, 500));
@@ -697,8 +733,10 @@ async function discoverFromXTwitter(firecrawlApiKey: string): Promise<string[]> 
     }
   }
 
-  // Deduplicate links
-  return [...new Set(links)];
+  return {
+    outboundLinks: [...new Set(outboundLinks)],
+    tweetEvents,
+  };
 }
 
 // ============ PLATFORM SCRAPERS ============
