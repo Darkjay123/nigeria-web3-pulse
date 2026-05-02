@@ -88,7 +88,7 @@ const BLOCKED_DOMAINS = [
 ];
 
 const LIST_ARTICLE_PHRASES = [
-  "top ", "best ", "list of", "in this article", "here are",
+  "list of", "in this article", "here are",
   "upcoming events in", "about us", "our team", "privacy policy",
   "terms of service", "cookie policy", "subscribe to", "sign up for our",
   "read more", "related articles", "you might also like",
@@ -96,8 +96,7 @@ const LIST_ARTICLE_PHRASES = [
   "share this", "comments section",
   "things to do", "events this week", "we've compiled", "we have compiled",
   "roundup", "round-up", "ultimate guide", "complete guide",
-  "discover the", "explore the", "check out these", "check out the",
-  "top 5", "top 10", "top 20", "best of", "must attend", "must-attend",
+  "check out these", "must attend", "must-attend",
 ];
 
 // Title-only blacklist patterns (listicle / blog signals)
@@ -217,7 +216,37 @@ interface NormalizedEvent {
   organizer: string | null;
   is_online: boolean;
   has_metadata_date: boolean;       // true if date came from API/JSON-LD, not text
+  source_type: "structured" | "discovery"; // routes through different gate rules
+  has_time_signal: boolean;         // includes vague time words for discovery mode
   _submission_count?: number;
+}
+
+// Relative time words — only honored in DISCOVERY mode (X, Reddit, Discord)
+const RELATIVE_TIME_WORDS = [
+  "today", "tomorrow", "tonight",
+  "this weekend", "this week", "this saturday", "this sunday",
+  "this monday", "this tuesday", "this wednesday", "this thursday", "this friday",
+  "next week", "next weekend",
+  "next monday", "next tuesday", "next wednesday", "next thursday",
+  "next friday", "next saturday", "next sunday",
+];
+
+function containsTimeWords(text: string): boolean {
+  const lower = text.toLowerCase();
+  for (const w of RELATIVE_TIME_WORDS) {
+    if (lower.includes(w)) return true;
+  }
+  // also bare weekday near "join us" / "happening"
+  if (/\b(?:happening|join\s+us|live|going\s+down)\b.{0,40}\b(?:mon|tue|wed|thu|fri|sat|sun)/i.test(text)) return true;
+  return false;
+}
+
+const STRUCTURED_PLATFORMS = new Set(["luma", "eventbrite", "meetup", "partiful", "community"]);
+const DISCOVERY_PLATFORMS = new Set(["x", "x_discovery", "twitter", "reddit", "discord"]);
+
+function classifySource(platform: string): "structured" | "discovery" {
+  if (DISCOVERY_PLATFORMS.has(platform)) return "discovery";
+  return "structured";
 }
 
 function normalizeEvent(raw: any): NormalizedEvent {
@@ -227,13 +256,14 @@ function normalizeEvent(raw: any): NormalizedEvent {
 
   const metaDate = raw.event_date || raw.metadata?.event_date || null;
   const textDate = !metaDate ? extractDate(fullText) : null;
+  const platform = (raw.source_platform || raw._source || "unknown").toString().toLowerCase();
 
   return {
     title,
     description,
     source_url: raw.source_url || null,
     registration_link: raw.registration_link || raw.source_url || null,
-    source_platform: raw.source_platform || "unknown",
+    source_platform: platform,
     venue: raw.venue || null,
     city: raw.city || null,
     event_date: metaDate || textDate,
@@ -242,45 +272,62 @@ function normalizeEvent(raw: any): NormalizedEvent {
     organizer: raw.organizer || null,
     is_online: !!raw.is_online || detectIsOnline(fullText),
     has_metadata_date: !!metaDate,
+    source_type: classifySource(platform),
+    has_time_signal: !!metaDate || !!textDate || containsTimeWords(fullText),
     _submission_count: raw._submission_count,
   };
 }
 
 /**
- * PAGE TYPE GATE (Stage 1 — Hard Filters, deterministic, METADATA-AWARE):
- * - Domain filter
- * - Listicle / blog detection (title + body)
- * - Event structure (≥2 signals)
- * - Date requirement: satisfied by EITHER text-date OR metadata date (fixes Luma false-rejects)
+ * PAGE TYPE GATE v8 — SOURCE-AWARE.
+ *
+ * STRUCTURED MODE (Eventbrite, Luma, Meetup, community):
+ *   - Domain check + listicle reject + ≥2 structure signals + real date (text/meta)
+ *
+ * DISCOVERY MODE (X, Reddit, Discord):
+ *   - Title-level listicle reject only
+ *   - Require ANY time signal (specific OR vague: "this Saturday")
+ *   - Web3 relevance enforced in Stage 2; structural rules left to AI
  */
 function pageTypeGate(ev: NormalizedEvent): { pass: boolean; reason: string } {
   const url = ev.source_url || "";
   const fullText = `${ev.title} ${ev.description}`;
 
-  // A) Domain check
-  const domainStatus = isAllowedDomain(url);
-  if (domainStatus === "blocked") {
-    return { pass: false, reason: `blocked domain: ${url}` };
+  // Title-level listicle reject — applies to BOTH modes
+  if (STRONG_LISTICLE_TITLE_RE.test(ev.title)) {
+    return { pass: false, reason: "listicle title pattern" };
+  }
+  for (const pat of LISTICLE_TITLE_PATTERNS) {
+    if (pat.test(ev.title)) return { pass: false, reason: "listicle title pattern" };
   }
 
-  // B) Listicle / blog detection
+  if (ev.source_type === "discovery") {
+    if (ev.title.length < 10) return { pass: false, reason: "discovery: title too short" };
+    if (!ev.has_time_signal) {
+      return { pass: false, reason: "discovery: no time signal (specific or relative)" };
+    }
+    return { pass: true, reason: "ok (discovery)" };
+  }
+
+  // STRUCTURED
+  const domainStatus = isAllowedDomain(url);
+  if (domainStatus === "blocked") return { pass: false, reason: `blocked domain: ${url}` };
+
   if (isListArticle(ev.title, fullText)) {
     return { pass: false, reason: "listicle/blog content detected" };
   }
 
-  // C) Structure check
   const structure = hasEventStructure(fullText);
   if (domainStatus === "unknown" && !structure.pass) {
     return { pass: false, reason: `unknown domain, weak event structure (signals=${structure.signals})` };
   }
 
-  // D) Date requirement — metadata-aware (FIX: previously rejected valid Luma events)
   const hasValidDate = structure.hasDate || ev.has_metadata_date || !!ev.event_date;
   if (domainStatus !== "allowed" && !hasValidDate) {
     return { pass: false, reason: "no specific date found (text or metadata)" };
   }
 
-  return { pass: true, reason: "ok" };
+  return { pass: true, reason: "ok (structured)" };
 }
 
 // ============ AI CLASSIFICATION ============
@@ -305,22 +352,27 @@ interface AIClassification {
 
 async function classifyWithAI(
   event: { title: string; description?: string; venue?: string; city?: string; source_url?: string },
-  apiKey: string
+  apiKey: string,
+  sourceType: "structured" | "discovery" = "structured",
 ): Promise<AIClassification | null> {
+  const modeRules = sourceType === "discovery"
+    ? `MODE: DISCOVERY (social post / tweet)
+Accept if it ANNOUNCES ONE specific upcoming Web3 event (meetup, hackathon, AMA, twitter space, workshop).
+A vague time like "this Saturday", "tomorrow", "next week" is acceptable IF the event itself is concrete.
+Reject if it is general commentary, a thread, news, or a promotional brand post with no specific event.
+Extract event_date as YYYY-MM-DD if you can resolve the relative time vs today.`
+    : `MODE: STRUCTURED (Eventbrite / Luma / Meetup / event page)
+Accept ONLY if it describes ONE specific event with a clear specific date, a location (or explicitly online), and a registration method.
+Reject blog posts, listicles ("Top 10..."), news articles, or generic pages.`;
+
   const userPrompt = `Analyze the following content and return STRICT JSON via the classify_event tool.
 
-Reject if:
-- It is a blog post, news article, or general article
-- It is a listicle / list of multiple events ("Top 10...", "Best events...", roundups)
-- It does not describe ONE specific event with a real date
-- Web3/blockchain/crypto is not the CORE topic
+${modeRules}
 
-Accept ONLY if:
-- It describes ONE specific event
-- Has a clear specific date (not "this week" / "soon")
-- Has a clear physical location OR is explicitly online
-- Has a registration / participation method
-- Web3 / blockchain / crypto / DeFi / NFT / DAO is the CORE topic
+Common rejects (BOTH MODES):
+- Listicles / roundups / "best of" articles
+- Blog posts, news articles
+- Web3 / blockchain / crypto / DeFi / NFT / DAO must be the CORE topic — not a side mention
 
 CONTENT:
 Title: ${event.title}
@@ -603,14 +655,22 @@ async function enrichLink(link: string, firecrawlApiKey: string): Promise<any | 
 }
 
 // ============ X/TWITTER DISCOVERY via Firecrawl search ============
-
-async function discoverFromXTwitter(firecrawlApiKey: string): Promise<string[]> {
-  const links: string[] = [];
+// Returns BOTH:
+//   - outboundLinks: lu.ma/eventbrite/meetup links found inside tweets (enrich → structured)
+//   - tweetEvents:    raw X-native events (the tweet IS the event) → discovery mode
+async function discoverFromXTwitter(firecrawlApiKey: string): Promise<{
+  outboundLinks: string[];
+  tweetEvents: any[];
+}> {
+  const outboundLinks: string[] = [];
+  const tweetEvents: any[] = [];
   const queries = [
-    'site:x.com "web3 event Lagos"',
-    'site:x.com "blockchain meetup Nigeria"',
-    'site:x.com "crypto conference Africa"',
+    'site:x.com "web3 event" Lagos',
+    'site:x.com "blockchain meetup" Nigeria',
+    'site:x.com "crypto meetup" Nigeria',
     'site:x.com "web3 hackathon" Nigeria',
+    'site:x.com "twitter space" web3 Nigeria',
+    'site:x.com web3 workshop Lagos',
   ];
 
   for (const query of queries) {
@@ -622,7 +682,11 @@ async function discoverFromXTwitter(firecrawlApiKey: string): Promise<string[]> 
           "Authorization": `Bearer ${firecrawlApiKey}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ query, limit: 5 }),
+        body: JSON.stringify({
+          query,
+          limit: 6,
+          scrapeOptions: { formats: ["markdown"] },
+        }),
       });
 
       if (!resp.ok) {
@@ -633,14 +697,38 @@ async function discoverFromXTwitter(firecrawlApiKey: string): Promise<string[]> 
       const data = await resp.json();
       const results = data.data || [];
 
-      // Extract links from tweet content
       for (const r of results) {
-        const text = `${r.markdown || ""} ${r.description || ""}`;
-        // Find Luma, Eventbrite, or other event links
-        const urlMatches = text.matchAll(/https?:\/\/(?:lu\.ma|www\.eventbrite\.com|meetup\.com|partiful\.com)[^\s")<\]]+/g);
-        for (const m of urlMatches) {
-          links.push(m[0]);
-        }
+        const tweetUrl: string = r.url || r.metadata?.sourceURL || "";
+        const md: string = r.markdown || r.content || "";
+        const desc: string = r.description || r.metadata?.description || "";
+        const title: string = r.title || r.metadata?.title || "";
+        const text = `${title}\n${desc}\n${md}`.trim();
+
+        if (!tweetUrl.includes("x.com") && !tweetUrl.includes("twitter.com")) continue;
+
+        // 1) Extract outbound event links
+        const urlMatches = text.matchAll(/https?:\/\/(?:lu\.ma|www\.eventbrite\.com|eventbrite\.com|meetup\.com|partiful\.com)[^\s")<\]]+/g);
+        for (const m of urlMatches) outboundLinks.push(m[0]);
+
+        // 2) Build a tweet-native event candidate
+        // Use first non-empty meaningful line as title; full text as description
+        const cleanedTitle = (title || desc.split("\n")[0] || md.split("\n").find(l => l.trim().length > 20) || "").trim().substring(0, 240);
+        if (cleanedTitle.length < 10) continue;
+
+        tweetEvents.push({
+          title: cleanedTitle,
+          description: text.substring(0, 1500),
+          source_url: tweetUrl,
+          registration_link: tweetUrl,
+          source_platform: "x",
+          venue: null,
+          city: null,
+          event_date: null,
+          event_time: null,
+          end_date: null,
+          organizer: null,
+          is_online: /twitter\s+space|x\s+space|virtual|online|zoom|gmeet|google\s+meet/i.test(text),
+        });
       }
 
       await new Promise(r => setTimeout(r, 500));
@@ -649,8 +737,10 @@ async function discoverFromXTwitter(firecrawlApiKey: string): Promise<string[]> 
     }
   }
 
-  // Deduplicate links
-  return [...new Set(links)];
+  return {
+    outboundLinks: [...new Set(outboundLinks)],
+    tweetEvents,
+  };
 }
 
 // ============ PLATFORM SCRAPERS ============
@@ -815,6 +905,15 @@ function finalValidate(ev: NormalizedEvent, ai: AIClassification): { ok: boolean
   if (ai.confidence < 0.85) return { ok: false, reason: `AI: low confidence ${ai.confidence}` };
 
   const eventDate = ai.event_date || ev.event_date;
+
+  if (ev.source_type === "discovery") {
+    // For X-style sources: AI confidence + event intent are enough.
+    // A vague time signal already passed Stage 1; AI extracted what it could.
+    // Allow null event_date — we will store the post itself.
+    return { ok: true, reason: "ok (discovery)" };
+  }
+
+  // STRUCTURED — strict
   if (!eventDate) return { ok: false, reason: "no resolvable date (text+metadata+AI all empty)" };
 
   const isOnline = ai.is_online || ev.is_online;
@@ -824,7 +923,7 @@ function finalValidate(ev: NormalizedEvent, ai: AIClassification): { ok: boolean
   const hasRegistration = !!ev.registration_link || !!ev.source_url || ai.has_registration;
   if (!hasRegistration) return { ok: false, reason: "no registration link" };
 
-  return { ok: true, reason: "ok" };
+  return { ok: true, reason: "ok (structured)" };
 }
 
 async function processEvent(
@@ -848,11 +947,12 @@ async function processEvent(
     return false;
   }
 
-  // STAGE 2: Web3 keyword pre-filter
+  // STAGE 2: Web3 keyword pre-filter (source-aware threshold)
   const kwScore = web3KeywordScore(fullText);
-  if (kwScore < 2) {
+  const kwThreshold = ev.source_type === "discovery" ? 1 : 2;
+  if (kwScore < kwThreshold) {
     stats.filtered_keyword++;
-    console.log(`[KEYWORD REJECT] "${ev.title}" (score=${kwScore})`);
+    console.log(`[KEYWORD REJECT] "${ev.title}" (score=${kwScore}, need=${kwThreshold}, mode=${ev.source_type})`);
     return false;
   }
 
@@ -865,7 +965,8 @@ async function processEvent(
 
   const aiResult = await classifyWithAI(
     { title: ev.title, description: ev.description, venue: ev.venue || undefined, city: ev.city || undefined, source_url: ev.source_url || undefined },
-    lovableApiKey
+    lovableApiKey,
+    ev.source_type,
   );
 
   if (!aiResult) {
@@ -956,10 +1057,11 @@ Deno.serve(async () => {
       luma: emptyStats(),
       eventbrite: emptyStats(),
       meetup: emptyStats(),
-      x_discovery: emptyStats(),
+      x: emptyStats(),                // tweet-native (discovery mode)
+      x_discovery: emptyStats(),      // outbound links enriched (structured mode)
     };
 
-    // ---- Phase 1: Scrape platforms in parallel ----
+    // ---- Phase 1: Scrape structured platforms in parallel ----
     const [lumaEvents, eventbriteEvents, meetupEvents] = await Promise.all([
       scrapeLumaEvents().catch(e => { results.luma.errors = String(e); return []; }),
       scrapeEventbriteEvents().catch(e => { results.eventbrite.errors = String(e); return []; }),
@@ -970,15 +1072,18 @@ Deno.serve(async () => {
     results.eventbrite.found = eventbriteEvents.length;
     results.meetup.found = meetupEvents.length;
 
-    // ---- Phase 1b: X/Twitter discovery → extract event links → enrich with Firecrawl ----
-    let xDiscoveredEvents: any[] = [];
+    // ---- Phase 1b: X/Twitter discovery (DUAL OUTPUT) ----
+    let xDiscoveredEvents: any[] = []; // enriched outbound (structured)
+    let xTweetEvents: any[] = [];      // tweet-native (discovery)
     if (firecrawlApiKey) {
       try {
-        const xLinks = await discoverFromXTwitter(firecrawlApiKey);
-        console.log(`[X Discovery] Found ${xLinks.length} event links from tweets`);
-        results.x_discovery.found = xLinks.length;
+        const { outboundLinks, tweetEvents } = await discoverFromXTwitter(firecrawlApiKey);
+        console.log(`[X Discovery] outbound=${outboundLinks.length} tweetEvents=${tweetEvents.length}`);
+        results.x_discovery.found = outboundLinks.length;
+        results.x.found = tweetEvents.length;
+        xTweetEvents = tweetEvents;
 
-        for (const link of xLinks.slice(0, 10)) {
+        for (const link of outboundLinks.slice(0, 8)) {
           const enriched = await enrichLink(link, firecrawlApiKey);
           if (enriched) {
             enriched.source_platform = "x_discovery";
@@ -990,19 +1095,25 @@ Deno.serve(async () => {
       }
     }
 
-    // ---- Phase 2: Process all events through pipeline (max 30 per run) ----
+    // ---- Phase 2: Process all events through pipeline ----
     const allRaw = [
       ...lumaEvents.map(e => ({ ...e, _source: 'luma' as const })),
       ...eventbriteEvents.map(e => ({ ...e, _source: 'eventbrite' as const })),
       ...meetupEvents.map(e => ({ ...e, _source: 'meetup' as const })),
       ...xDiscoveredEvents.map(e => ({ ...e, _source: 'x_discovery' as const })),
+      ...xTweetEvents.map(e => ({ ...e, _source: 'x' as const })),
     ];
 
-    console.log(`Total raw candidates: ${allRaw.length} (max 30 will be processed)`);
+    console.log(`Total raw candidates: ${allRaw.length} (max 50 will be processed)`);
+
+    // Source breakdown logging
+    const sourceBreakdown: Record<string, number> = {};
+    for (const r of allRaw) sourceBreakdown[r._source] = (sourceBreakdown[r._source] || 0) + 1;
+    console.log(`[BREAKDOWN raw] ${JSON.stringify(sourceBreakdown)}`);
 
     let processed = 0;
     for (const raw of allRaw) {
-      if (processed >= 30) break; // Cap per run for performance
+      if (processed >= 50) break; // Cap per run
       try {
         await processEvent(raw, raw._source, supabase, lovableApiKey, results[raw._source]);
         processed++;
