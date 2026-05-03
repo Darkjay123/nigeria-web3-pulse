@@ -1194,6 +1194,22 @@ Deno.serve(async () => {
     results.eventbrite.found = eventbriteEvents.length;
     results.meetup.found = meetupEvents.length;
 
+    // Enrich Luma candidates with full page content (date/venue live in JSON-LD/metadata)
+    const enrichedLuma: any[] = [];
+    if (firecrawlApiKey && lumaEvents.length > 0) {
+      for (const lev of lumaEvents.slice(0, 8)) {
+        const enriched = await enrichLink(lev.source_url, firecrawlApiKey);
+        if (enriched) {
+          enriched.source_platform = "luma";
+          enriched.title = enriched.title || lev.title;
+          enrichedLuma.push(enriched);
+        } else {
+          // Keep the lightweight candidate so the AI still gets a shot
+          enrichedLuma.push(lev);
+        }
+      }
+    }
+
     // ---- Phase 1b: X/Twitter discovery (DUAL OUTPUT) ----
     let xDiscoveredEvents: any[] = []; // enriched outbound (structured)
     let xTweetEvents: any[] = [];      // tweet-native (discovery)
