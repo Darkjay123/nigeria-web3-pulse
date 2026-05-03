@@ -963,18 +963,26 @@ async function scrapeMeetupEvents(): Promise<any[]> {
 function finalValidate(ev: NormalizedEvent, ai: AIClassification): { ok: boolean; reason: string } {
   if (!ai.is_event) return { ok: false, reason: `AI: not an event (${ai.reason})` };
   if (ai.is_listicle) return { ok: false, reason: `AI: listicle (${ai.reason})` };
-  if (ai.confidence < 0.85) return { ok: false, reason: `AI: low confidence ${ai.confidence}` };
+
+  // AI reason anti-drift guard — reject hedged or past-event language.
+  if (ai.reason && AI_UNCERTAIN_RE.test(ai.reason)) {
+    return { ok: false, reason: `AI: hedged/past-event language ("${ai.reason}")` };
+  }
 
   const eventDate = ai.event_date || ev.event_date;
 
+  // Future-event validation — only when a real date was resolvable.
+  if (isPastDate(eventDate)) {
+    return { ok: false, reason: `past event (date=${eventDate})` };
+  }
+
   if (ev.source_type === "discovery") {
-    // For X-style sources: AI confidence + event intent are enough.
-    // A vague time signal already passed Stage 1; AI extracted what it could.
-    // Allow null event_date — we will store the post itself.
+    if (ai.confidence < 0.85) return { ok: false, reason: `AI discovery: low confidence ${ai.confidence}` };
     return { ok: true, reason: "ok (discovery)" };
   }
 
   // STRUCTURED — strict
+  if (ai.confidence < 0.85) return { ok: false, reason: `AI: low confidence ${ai.confidence}` };
   if (!eventDate) return { ok: false, reason: "no resolvable date (text+metadata+AI all empty)" };
 
   const isOnline = ai.is_online || ev.is_online;
