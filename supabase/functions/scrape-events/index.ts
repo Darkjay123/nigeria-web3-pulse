@@ -1185,7 +1185,7 @@ Deno.serve(async () => {
 
     // ---- Phase 1: Scrape structured platforms in parallel ----
     const [lumaEvents, eventbriteEvents, meetupEvents] = await Promise.all([
-      scrapeLumaEvents().catch(e => { results.luma.errors = String(e); return []; }),
+      scrapeLumaEvents(firecrawlApiKey).catch(e => { results.luma.errors = String(e); return []; }),
       scrapeEventbriteEvents().catch(e => { results.eventbrite.errors = String(e); return []; }),
       scrapeMeetupEvents().catch(e => { results.meetup.errors = String(e); return []; }),
     ]);
