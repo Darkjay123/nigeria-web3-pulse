@@ -241,6 +241,67 @@ function containsTimeWords(text: string): boolean {
   return false;
 }
 
+// ============ DISCOVERY INTENT + SIGNAL SCORING (v9) ============
+// Deterministic pre-AI guards for DISCOVERY mode only.
+
+const EVENT_INTENT_PATTERNS: RegExp[] = [
+  /\bjoin\s+us\b/i,
+  /\bregister(?:ing|ed)?\b/i,
+  /\brsvp\b/i,
+  /\bdon[''']?t\s+miss\b/i,
+  /\bwe[''']?re\s+host(?:ing)?\b/i,
+  /\bwe\s+are\s+hosting\b/i,
+  /\bwe[''']?re\s+organi[sz]ing\b/i,
+  /\bhosting\s+(?:a|an|the)\b/i,
+  /\b(?:twitter\s+)?spaces?\b/i,
+  /\bx\s+space\b/i,
+  /\bama\b/i,
+  /\blive\s+session\b/i,
+  /\bworkshop\b/i,
+  /\bmeetup\b/i,
+  /\bhackathon\b/i,
+  /\bsave\s+the\s+date\b/i,
+  /\bget\s+(?:your\s+)?tickets?\b/i,
+  /\bsign\s+up\b/i,
+  /\bstarts?\s+(?:in|at|on)\b/i,
+  /\bhappening\s+(?:on|this|tomorrow|today|tonight)\b/i,
+];
+
+function hasEventIntent(text: string): boolean {
+  for (const p of EVENT_INTENT_PATTERNS) if (p.test(text)) return true;
+  return false;
+}
+
+const PLATFORM_INDICATOR_RE = /\b(spaces?|x\s+space|twitter\s+space|meetup|workshop|ama|hackathon|conference|summit|webinar|bootcamp)\b/i;
+
+function discoverySignalScore(ev: NormalizedEvent, fullText: string): {
+  score: number;
+  web3: boolean;
+  time: boolean;
+  intent: boolean;
+  platform: boolean;
+} {
+  const web3 = web3KeywordScore(fullText) >= 1;
+  const time = ev.has_time_signal;
+  const intent = hasEventIntent(fullText);
+  const platform = PLATFORM_INDICATOR_RE.test(fullText);
+  const score = (web3 ? 1 : 0) + (time ? 1 : 0) + (intent ? 1 : 0) + (platform ? 1 : 0);
+  return { score, web3, time, intent, platform };
+}
+
+// Past-event detection: only fires when a date is actually parsed.
+function isPastDate(date: string | null): boolean {
+  if (!date) return false;
+  const d = new Date(date);
+  if (isNaN(d.getTime())) return false;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return d.getTime() < today.getTime();
+}
+
+// AI reason words that indicate uncertainty or past-event drift.
+const AI_UNCERTAIN_RE = /\b(maybe|unclear|uncertain|might\s+be|possibly|recap|past\s+event|already\s+happened|retrospective|reflection|history|throwback)\b/i;
+
 const STRUCTURED_PLATFORMS = new Set(["luma", "eventbrite", "meetup", "partiful", "community"]);
 const DISCOVERY_PLATFORMS = new Set(["x", "x_discovery", "twitter", "reddit", "discord"]);
 
