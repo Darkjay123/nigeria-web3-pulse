@@ -1078,10 +1078,12 @@ async function processEvent(
   const verdict = finalValidate(ev, aiResult);
   if (!verdict.ok) {
     stats.filtered_ai++;
-    console.log(`[FINAL REJECT] "${ev.title}" — ${verdict.reason} | AI conf=${aiResult.confidence}`);
+    const tag = ev.source_type === "discovery" ? "AI REJECT DISCOVERY" : "FINAL REJECT";
+    console.log(`[${tag}] "${ev.title}" — ${verdict.reason} | AI conf=${aiResult.confidence}`);
     return false;
   }
-  console.log(`[ACCEPT] "${ev.title}" (confidence=${aiResult.confidence})`);
+  const acceptTag = ev.source_type === "discovery" ? "AI ACCEPT DISCOVERY" : "ACCEPT";
+  console.log(`[${acceptTag}] "${ev.title}" confidence=${aiResult.confidence} reason="${aiResult.reason}"`);
 
   // Build final record
   const eventDate = aiResult.event_date || ev.event_date;
