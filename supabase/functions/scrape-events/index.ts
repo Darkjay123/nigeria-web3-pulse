@@ -806,50 +806,71 @@ async function discoverFromXTwitter(firecrawlApiKey: string): Promise<{
 
 // ============ PLATFORM SCRAPERS ============
 
-async function scrapeLumaEvents(): Promise<any[]> {
+// Luma's public REST search API (api.lu.ma/public/v2/event/search) returns 404 — deprecated.
+// New strategy: use Firecrawl `/search` to find real lu.ma event pages, then enrich each one.
+// Firecrawl pulls JSON-LD + metadata, which is far more reliable than HTML scraping.
+async function scrapeLumaEvents(firecrawlApiKey: string): Promise<any[]> {
   const events: any[] = [];
+  if (!firecrawlApiKey) {
+    console.warn('[Luma] No Firecrawl key — skipping Luma discovery');
+    return events;
+  }
+
   const queries = [
-    "web3+nigeria", "blockchain+lagos", "crypto+nigeria", "web3+africa",
-    "blockchain+africa", "defi+nigeria", "nft+lagos",
+    'site:lu.ma web3 nigeria',
+    'site:lu.ma blockchain lagos',
+    'site:lu.ma crypto africa',
+    'site:lu.ma defi nigeria',
   ];
 
+  const seen = new Set<string>();
   for (const query of queries) {
     try {
-      const url = `https://api.lu.ma/public/v2/event/search?query=${query}&pagination_limit=20`;
-      console.log(`[Luma] Fetching: ${url}`);
-      const resp = await fetch(url, { headers: { 'Accept': 'application/json' } });
-
+      console.log(`[Luma] Firecrawl search: "${query}"`);
+      const resp = await fetch(`${FIRECRAWL_API_URL}/search`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${firecrawlApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ query, limit: 5 }),
+      });
       if (!resp.ok) {
-        // No HTML fallback — the section-headings it scraped were noise that wasted the pipeline.
-        // If the Luma JSON API fails, skip this query entirely.
-        console.warn(`[Luma] API failed for "${query}" (${resp.status}), skipping`);
+        console.warn(`[Luma] Search failed for "${query}" (${resp.status})`);
         continue;
       }
-
       const data = await resp.json();
-      const entries = data.entries || data.data || [];
-
-      for (const entry of entries) {
-        const ev = entry.event || entry;
+      const results = data.data || [];
+      for (const r of results) {
+        const url: string = r.url || r.metadata?.sourceURL || '';
+        // Only individual event pages, not profile/group pages
+        if (!/^https?:\/\/lu\.ma\/[a-z0-9-]{4,}$/i.test(url)) continue;
+        if (seen.has(url)) continue;
+        seen.add(url);
+        const title: string = r.title || r.metadata?.title || '';
+        const description: string = r.description || r.metadata?.description || '';
+        if (!title || title.length < 5) continue;
         events.push({
-          title: ev.name || ev.title || "",
-          description: ev.description || "",
-          event_date: ev.start_at ? new Date(ev.start_at).toISOString().split('T')[0] : null,
-          event_time: ev.start_at ? new Date(ev.start_at).toTimeString().split(' ')[0] : null,
-          end_date: ev.end_at ? new Date(ev.end_at).toISOString().split('T')[0] : null,
-          venue: ev.geo_address_info?.full_address || ev.location || null,
-          city: ev.geo_address_info?.city || null,
-          registration_link: ev.url ? `https://lu.ma/${ev.url}` : null,
-          source_url: ev.url ? `https://lu.ma/${ev.url}` : null,
-          source_platform: "luma",
-          is_online: ev.location_type === "online" || false,
-          organizer: ev.hosts?.[0]?.name || null,
+          title,
+          description,
+          event_date: null, // will be resolved by enrichLink + AI
+          event_time: null,
+          end_date: null,
+          venue: null,
+          city: null,
+          registration_link: url,
+          source_url: url,
+          source_platform: 'luma',
+          is_online: false,
+          organizer: null,
         });
       }
+      await new Promise(r => setTimeout(r, 400));
     } catch (e) {
       console.error(`[Luma] Error for "${query}":`, e);
     }
   }
+  console.log(`[Luma] Discovered ${events.length} candidate event pages`);
   return events;
 }
 
