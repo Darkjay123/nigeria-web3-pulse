@@ -1025,6 +1025,36 @@ async function processEvent(
     return false;
   }
 
+  // STAGE 2b (DISCOVERY ONLY): Intent + signal-score gate — kills tweets with no
+  // event intent (recaps, news, brand chatter) BEFORE we spend AI tokens on them.
+  if (ev.source_type === "discovery") {
+    const sig = discoverySignalScore(ev, fullText);
+    if (!sig.intent) {
+      stats.filtered_keyword++;
+      console.log(`[DISCOVERY REJECT] "${ev.title}" — no intent signal (score=${sig.score}, web3=${sig.web3} time=${sig.time} platform=${sig.platform})`);
+      return false;
+    }
+    if (sig.score < 2) {
+      stats.filtered_keyword++;
+      console.log(`[DISCOVERY REJECT] "${ev.title}" — low score=${sig.score} (need ≥2)`);
+      return false;
+    }
+    // Past-date short-circuit before AI (saves a call)
+    if (isPastDate(ev.event_date)) {
+      stats.filtered_gate++;
+      console.log(`[DISCOVERY REJECT] "${ev.title}" — past date ${ev.event_date}`);
+      return false;
+    }
+    console.log(`[DISCOVERY PASS] "${ev.title.substring(0, 60)}" score=${sig.score} intent=${sig.intent} time=${sig.time} platform=${sig.platform}`);
+  } else {
+    // Structured: hard past-date short-circuit before AI
+    if (isPastDate(ev.event_date)) {
+      stats.filtered_gate++;
+      console.log(`[GATE REJECT] "${ev.title}" — past date ${ev.event_date}`);
+      return false;
+    }
+  }
+
   // STAGE 3: AI classification (CLASSIFICATION ONLY — no enforcement here)
   if (!lovableApiKey) {
     stats.filtered_ai++;
