@@ -1060,10 +1060,12 @@ async function processEvent(
       console.log(`[DISCOVERY REJECT] "${ev.title}" — low score=${sig.score} (need ≥2)`);
       return false;
     }
-    // Past-date short-circuit before AI (saves a call)
-    if (isPastDate(ev.event_date)) {
+    // Past-date short-circuit — ONLY trust metadata dates here. Text-extracted dates
+    // in tweets are noisy (random YYYY-MM-DD substrings, embedded timestamps).
+    // The AI will resolve the real date later; finalValidate will reject if past.
+    if (ev.has_metadata_date && isPastDate(ev.event_date)) {
       stats.filtered_gate++;
-      console.log(`[DISCOVERY REJECT] "${ev.title}" — past date ${ev.event_date}`);
+      console.log(`[DISCOVERY REJECT] "${ev.title}" — past metadata date ${ev.event_date}`);
       return false;
     }
     console.log(`[DISCOVERY PASS] "${ev.title.substring(0, 60)}" score=${sig.score} intent=${sig.intent} time=${sig.time} platform=${sig.platform}`);
