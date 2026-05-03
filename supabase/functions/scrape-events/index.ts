@@ -1070,10 +1070,11 @@ async function processEvent(
     }
     console.log(`[DISCOVERY PASS] "${ev.title.substring(0, 60)}" score=${sig.score} intent=${sig.intent} time=${sig.time} platform=${sig.platform}`);
   } else {
-    // Structured: hard past-date short-circuit before AI
-    if (isPastDate(ev.event_date)) {
+    // Structured: short-circuit on past metadata dates only.
+    // (Text-extracted dates from enriched markdown are unreliable; let AI resolve.)
+    if (ev.has_metadata_date && isPastDate(ev.event_date)) {
       stats.filtered_gate++;
-      console.log(`[GATE REJECT] "${ev.title}" — past date ${ev.event_date}`);
+      console.log(`[GATE REJECT] "${ev.title}" — past metadata date ${ev.event_date}`);
       return false;
     }
   }
