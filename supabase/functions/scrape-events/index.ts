@@ -1235,7 +1235,7 @@ Deno.serve(async () => {
 
     // ---- Phase 2: Process all events through pipeline ----
     const allRaw = [
-      ...lumaEvents.map(e => ({ ...e, _source: 'luma' as const })),
+      ...enrichedLuma.map(e => ({ ...e, _source: 'luma' as const })),
       ...eventbriteEvents.map(e => ({ ...e, _source: 'eventbrite' as const })),
       ...meetupEvents.map(e => ({ ...e, _source: 'meetup' as const })),
       ...xDiscoveredEvents.map(e => ({ ...e, _source: 'x_discovery' as const })),
