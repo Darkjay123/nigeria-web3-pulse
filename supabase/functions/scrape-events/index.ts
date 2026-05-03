@@ -241,6 +241,67 @@ function containsTimeWords(text: string): boolean {
   return false;
 }
 
+// ============ DISCOVERY INTENT + SIGNAL SCORING (v9) ============
+// Deterministic pre-AI guards for DISCOVERY mode only.
+
+const EVENT_INTENT_PATTERNS: RegExp[] = [
+  /\bjoin\s+us\b/i,
+  /\bregister(?:ing|ed)?\b/i,
+  /\brsvp\b/i,
+  /\bdon[''']?t\s+miss\b/i,
+  /\bwe[''']?re\s+host(?:ing)?\b/i,
+  /\bwe\s+are\s+hosting\b/i,
+  /\bwe[''']?re\s+organi[sz]ing\b/i,
+  /\bhosting\s+(?:a|an|the)\b/i,
+  /\b(?:twitter\s+)?spaces?\b/i,
+  /\bx\s+space\b/i,
+  /\bama\b/i,
+  /\blive\s+session\b/i,
+  /\bworkshop\b/i,
+  /\bmeetup\b/i,
+  /\bhackathon\b/i,
+  /\bsave\s+the\s+date\b/i,
+  /\bget\s+(?:your\s+)?tickets?\b/i,
+  /\bsign\s+up\b/i,
+  /\bstarts?\s+(?:in|at|on)\b/i,
+  /\bhappening\s+(?:on|this|tomorrow|today|tonight)\b/i,
+];
+
+function hasEventIntent(text: string): boolean {
+  for (const p of EVENT_INTENT_PATTERNS) if (p.test(text)) return true;
+  return false;
+}
+
+const PLATFORM_INDICATOR_RE = /\b(spaces?|x\s+space|twitter\s+space|meetup|workshop|ama|hackathon|conference|summit|webinar|bootcamp)\b/i;
+
+function discoverySignalScore(ev: NormalizedEvent, fullText: string): {
+  score: number;
+  web3: boolean;
+  time: boolean;
+  intent: boolean;
+  platform: boolean;
+} {
+  const web3 = web3KeywordScore(fullText) >= 1;
+  const time = ev.has_time_signal;
+  const intent = hasEventIntent(fullText);
+  const platform = PLATFORM_INDICATOR_RE.test(fullText);
+  const score = (web3 ? 1 : 0) + (time ? 1 : 0) + (intent ? 1 : 0) + (platform ? 1 : 0);
+  return { score, web3, time, intent, platform };
+}
+
+// Past-event detection: only fires when a date is actually parsed.
+function isPastDate(date: string | null): boolean {
+  if (!date) return false;
+  const d = new Date(date);
+  if (isNaN(d.getTime())) return false;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return d.getTime() < today.getTime();
+}
+
+// AI reason words that indicate uncertainty or past-event drift.
+const AI_UNCERTAIN_RE = /\b(maybe|unclear|uncertain|might\s+be|possibly|recap|past\s+event|already\s+happened|retrospective|reflection|history|throwback)\b/i;
+
 const STRUCTURED_PLATFORMS = new Set(["luma", "eventbrite", "meetup", "partiful", "community"]);
 const DISCOVERY_PLATFORMS = new Set(["x", "x_discovery", "twitter", "reddit", "discord"]);
 
@@ -745,50 +806,71 @@ async function discoverFromXTwitter(firecrawlApiKey: string): Promise<{
 
 // ============ PLATFORM SCRAPERS ============
 
-async function scrapeLumaEvents(): Promise<any[]> {
+// Luma's public REST search API (api.lu.ma/public/v2/event/search) returns 404 — deprecated.
+// New strategy: use Firecrawl `/search` to find real lu.ma event pages, then enrich each one.
+// Firecrawl pulls JSON-LD + metadata, which is far more reliable than HTML scraping.
+async function scrapeLumaEvents(firecrawlApiKey: string): Promise<any[]> {
   const events: any[] = [];
+  if (!firecrawlApiKey) {
+    console.warn('[Luma] No Firecrawl key — skipping Luma discovery');
+    return events;
+  }
+
   const queries = [
-    "web3+nigeria", "blockchain+lagos", "crypto+nigeria", "web3+africa",
-    "blockchain+africa", "defi+nigeria", "nft+lagos",
+    'site:lu.ma web3 nigeria',
+    'site:lu.ma blockchain lagos',
+    'site:lu.ma crypto africa',
+    'site:lu.ma defi nigeria',
   ];
 
+  const seen = new Set<string>();
   for (const query of queries) {
     try {
-      const url = `https://api.lu.ma/public/v2/event/search?query=${query}&pagination_limit=20`;
-      console.log(`[Luma] Fetching: ${url}`);
-      const resp = await fetch(url, { headers: { 'Accept': 'application/json' } });
-
+      console.log(`[Luma] Firecrawl search: "${query}"`);
+      const resp = await fetch(`${FIRECRAWL_API_URL}/search`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${firecrawlApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ query, limit: 5 }),
+      });
       if (!resp.ok) {
-        // No HTML fallback — the section-headings it scraped were noise that wasted the pipeline.
-        // If the Luma JSON API fails, skip this query entirely.
-        console.warn(`[Luma] API failed for "${query}" (${resp.status}), skipping`);
+        console.warn(`[Luma] Search failed for "${query}" (${resp.status})`);
         continue;
       }
-
       const data = await resp.json();
-      const entries = data.entries || data.data || [];
-
-      for (const entry of entries) {
-        const ev = entry.event || entry;
+      const results = data.data || [];
+      for (const r of results) {
+        const url: string = r.url || r.metadata?.sourceURL || '';
+        // Only individual event pages, not profile/group pages
+        if (!/^https?:\/\/lu\.ma\/[a-z0-9-]{4,}$/i.test(url)) continue;
+        if (seen.has(url)) continue;
+        seen.add(url);
+        const title: string = r.title || r.metadata?.title || '';
+        const description: string = r.description || r.metadata?.description || '';
+        if (!title || title.length < 5) continue;
         events.push({
-          title: ev.name || ev.title || "",
-          description: ev.description || "",
-          event_date: ev.start_at ? new Date(ev.start_at).toISOString().split('T')[0] : null,
-          event_time: ev.start_at ? new Date(ev.start_at).toTimeString().split(' ')[0] : null,
-          end_date: ev.end_at ? new Date(ev.end_at).toISOString().split('T')[0] : null,
-          venue: ev.geo_address_info?.full_address || ev.location || null,
-          city: ev.geo_address_info?.city || null,
-          registration_link: ev.url ? `https://lu.ma/${ev.url}` : null,
-          source_url: ev.url ? `https://lu.ma/${ev.url}` : null,
-          source_platform: "luma",
-          is_online: ev.location_type === "online" || false,
-          organizer: ev.hosts?.[0]?.name || null,
+          title,
+          description,
+          event_date: null, // will be resolved by enrichLink + AI
+          event_time: null,
+          end_date: null,
+          venue: null,
+          city: null,
+          registration_link: url,
+          source_url: url,
+          source_platform: 'luma',
+          is_online: false,
+          organizer: null,
         });
       }
+      await new Promise(r => setTimeout(r, 400));
     } catch (e) {
       console.error(`[Luma] Error for "${query}":`, e);
     }
   }
+  console.log(`[Luma] Discovered ${events.length} candidate event pages`);
   return events;
 }
 
@@ -902,18 +984,26 @@ async function scrapeMeetupEvents(): Promise<any[]> {
 function finalValidate(ev: NormalizedEvent, ai: AIClassification): { ok: boolean; reason: string } {
   if (!ai.is_event) return { ok: false, reason: `AI: not an event (${ai.reason})` };
   if (ai.is_listicle) return { ok: false, reason: `AI: listicle (${ai.reason})` };
-  if (ai.confidence < 0.85) return { ok: false, reason: `AI: low confidence ${ai.confidence}` };
+
+  // AI reason anti-drift guard — reject hedged or past-event language.
+  if (ai.reason && AI_UNCERTAIN_RE.test(ai.reason)) {
+    return { ok: false, reason: `AI: hedged/past-event language ("${ai.reason}")` };
+  }
 
   const eventDate = ai.event_date || ev.event_date;
 
+  // Future-event validation — only when a real date was resolvable.
+  if (isPastDate(eventDate)) {
+    return { ok: false, reason: `past event (date=${eventDate})` };
+  }
+
   if (ev.source_type === "discovery") {
-    // For X-style sources: AI confidence + event intent are enough.
-    // A vague time signal already passed Stage 1; AI extracted what it could.
-    // Allow null event_date — we will store the post itself.
+    if (ai.confidence < 0.85) return { ok: false, reason: `AI discovery: low confidence ${ai.confidence}` };
     return { ok: true, reason: "ok (discovery)" };
   }
 
   // STRUCTURED — strict
+  if (ai.confidence < 0.85) return { ok: false, reason: `AI: low confidence ${ai.confidence}` };
   if (!eventDate) return { ok: false, reason: "no resolvable date (text+metadata+AI all empty)" };
 
   const isOnline = ai.is_online || ev.is_online;
@@ -956,6 +1046,39 @@ async function processEvent(
     return false;
   }
 
+  // STAGE 2b (DISCOVERY ONLY): Intent + signal-score gate — kills tweets with no
+  // event intent (recaps, news, brand chatter) BEFORE we spend AI tokens on them.
+  if (ev.source_type === "discovery") {
+    const sig = discoverySignalScore(ev, fullText);
+    if (!sig.intent) {
+      stats.filtered_keyword++;
+      console.log(`[DISCOVERY REJECT] "${ev.title}" — no intent signal (score=${sig.score}, web3=${sig.web3} time=${sig.time} platform=${sig.platform})`);
+      return false;
+    }
+    if (sig.score < 2) {
+      stats.filtered_keyword++;
+      console.log(`[DISCOVERY REJECT] "${ev.title}" — low score=${sig.score} (need ≥2)`);
+      return false;
+    }
+    // Past-date short-circuit — ONLY trust metadata dates here. Text-extracted dates
+    // in tweets are noisy (random YYYY-MM-DD substrings, embedded timestamps).
+    // The AI will resolve the real date later; finalValidate will reject if past.
+    if (ev.has_metadata_date && isPastDate(ev.event_date)) {
+      stats.filtered_gate++;
+      console.log(`[DISCOVERY REJECT] "${ev.title}" — past metadata date ${ev.event_date}`);
+      return false;
+    }
+    console.log(`[DISCOVERY PASS] "${ev.title.substring(0, 60)}" score=${sig.score} intent=${sig.intent} time=${sig.time} platform=${sig.platform}`);
+  } else {
+    // Structured: short-circuit on past metadata dates only.
+    // (Text-extracted dates from enriched markdown are unreliable; let AI resolve.)
+    if (ev.has_metadata_date && isPastDate(ev.event_date)) {
+      stats.filtered_gate++;
+      console.log(`[GATE REJECT] "${ev.title}" — past metadata date ${ev.event_date}`);
+      return false;
+    }
+  }
+
   // STAGE 3: AI classification (CLASSIFICATION ONLY — no enforcement here)
   if (!lovableApiKey) {
     stats.filtered_ai++;
@@ -979,10 +1102,12 @@ async function processEvent(
   const verdict = finalValidate(ev, aiResult);
   if (!verdict.ok) {
     stats.filtered_ai++;
-    console.log(`[FINAL REJECT] "${ev.title}" — ${verdict.reason} | AI conf=${aiResult.confidence}`);
+    const tag = ev.source_type === "discovery" ? "AI REJECT DISCOVERY" : "FINAL REJECT";
+    console.log(`[${tag}] "${ev.title}" — ${verdict.reason} | AI conf=${aiResult.confidence}`);
     return false;
   }
-  console.log(`[ACCEPT] "${ev.title}" (confidence=${aiResult.confidence})`);
+  const acceptTag = ev.source_type === "discovery" ? "AI ACCEPT DISCOVERY" : "ACCEPT";
+  console.log(`[${acceptTag}] "${ev.title}" confidence=${aiResult.confidence} reason="${aiResult.reason}"`);
 
   // Build final record
   const eventDate = aiResult.event_date || ev.event_date;
@@ -1063,7 +1188,7 @@ Deno.serve(async () => {
 
     // ---- Phase 1: Scrape structured platforms in parallel ----
     const [lumaEvents, eventbriteEvents, meetupEvents] = await Promise.all([
-      scrapeLumaEvents().catch(e => { results.luma.errors = String(e); return []; }),
+      scrapeLumaEvents(firecrawlApiKey).catch(e => { results.luma.errors = String(e); return []; }),
       scrapeEventbriteEvents().catch(e => { results.eventbrite.errors = String(e); return []; }),
       scrapeMeetupEvents().catch(e => { results.meetup.errors = String(e); return []; }),
     ]);
@@ -1071,6 +1196,22 @@ Deno.serve(async () => {
     results.luma.found = lumaEvents.length;
     results.eventbrite.found = eventbriteEvents.length;
     results.meetup.found = meetupEvents.length;
+
+    // Enrich Luma candidates with full page content (date/venue live in JSON-LD/metadata)
+    const enrichedLuma: any[] = [];
+    if (firecrawlApiKey && lumaEvents.length > 0) {
+      for (const lev of lumaEvents.slice(0, 8)) {
+        const enriched = await enrichLink(lev.source_url, firecrawlApiKey);
+        if (enriched) {
+          enriched.source_platform = "luma";
+          enriched.title = enriched.title || lev.title;
+          enrichedLuma.push(enriched);
+        } else {
+          // Keep the lightweight candidate so the AI still gets a shot
+          enrichedLuma.push(lev);
+        }
+      }
+    }
 
     // ---- Phase 1b: X/Twitter discovery (DUAL OUTPUT) ----
     let xDiscoveredEvents: any[] = []; // enriched outbound (structured)
@@ -1097,7 +1238,7 @@ Deno.serve(async () => {
 
     // ---- Phase 2: Process all events through pipeline ----
     const allRaw = [
-      ...lumaEvents.map(e => ({ ...e, _source: 'luma' as const })),
+      ...enrichedLuma.map(e => ({ ...e, _source: 'luma' as const })),
       ...eventbriteEvents.map(e => ({ ...e, _source: 'eventbrite' as const })),
       ...meetupEvents.map(e => ({ ...e, _source: 'meetup' as const })),
       ...xDiscoveredEvents.map(e => ({ ...e, _source: 'x_discovery' as const })),
