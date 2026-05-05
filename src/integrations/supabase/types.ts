@@ -252,7 +252,13 @@ export type Database = {
       [_ in never]: never
     }
     Enums: {
-      event_status: "upcoming" | "ongoing" | "completed" | "cancelled"
+      event_status:
+        | "upcoming"
+        | "ongoing"
+        | "completed"
+        | "cancelled"
+        | "pending_review"
+        | "rejected"
       event_type:
         | "meetup"
         | "hackathon"
@@ -391,7 +397,14 @@ export type CompositeTypes<
 export const Constants = {
   public: {
     Enums: {
-      event_status: ["upcoming", "ongoing", "completed", "cancelled"],
+      event_status: [
+        "upcoming",
+        "ongoing",
+        "completed",
+        "cancelled",
+        "pending_review",
+        "rejected",
+      ],
       event_type: [
         "meetup",
         "hackathon",

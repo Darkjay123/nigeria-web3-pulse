@@ -265,6 +265,13 @@ const EVENT_INTENT_PATTERNS: RegExp[] = [
   /\bsign\s+up\b/i,
   /\bstarts?\s+(?:in|at|on)\b/i,
   /\bhappening\s+(?:on|this|tomorrow|today|tonight)\b/i,
+  // v10 — CTA / urgency
+  /\bdm\s+(?:to|me|us)\b/i,
+  /\blink\s+in\s+bio\b/i,
+  /\bregister\s+here\b/i,
+  /\bclick\s+(?:to|here)\s+(?:join|register|rsvp)\b/i,
+  /\b(?:tonight|today|tomorrow)\b.{0,30}\b(?:web3|crypto|blockchain|defi|nft|spaces?|ama|meetup)\b/i,
+  /\b(?:web3|crypto|blockchain|defi|nft|spaces?|ama|meetup)\b.{0,30}\b(?:tonight|today|tomorrow|this\s+(?:sat|sun|mon|tue|wed|thu|fri))/i,
 ];
 
 function hasEventIntent(text: string): boolean {
@@ -469,41 +476,52 @@ Description: ${(event.description || "").substring(0, 1500)}`;
     },
   }];
 
-  try {
-    const resp = await fetch(AI_GATEWAY_URL, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "google/gemini-2.5-flash",
-        messages: [
-          { role: "system", content: "You are an event classification engine. Be strict. Reject anything that is not a single, specific Web3 event. Bias toward rejection when in doubt." },
-          { role: "user", content: userPrompt },
-        ],
-        tools,
-        tool_choice: { type: "function", function: { name: "classify_event" } },
-        temperature: 0.0,
-      }),
-    });
+  const body = JSON.stringify({
+    model: "google/gemini-2.5-flash",
+    messages: [
+      { role: "system", content: "You are an event classification engine. Be strict. Reject anything that is not a single, specific Web3 event. Bias toward rejection when in doubt." },
+      { role: "user", content: userPrompt },
+    ],
+    tools,
+    tool_choice: { type: "function", function: { name: "classify_event" } },
+    temperature: 0.0,
+  });
 
-    if (!resp.ok) {
-      console.error(`[AI] Classification failed: ${resp.status} ${await resp.text().catch(() => "")}`);
-      return null;
-    }
+  // Retry up to 2 times on 429/5xx with exponential backoff
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const resp = await fetch(AI_GATEWAY_URL, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body,
+      });
 
-    const data = await resp.json();
-    const toolCall = data.choices?.[0]?.message?.tool_calls?.[0];
-    if (!toolCall?.function?.arguments) {
-      console.error('[AI] No tool call in response');
-      return null;
+      if (resp.status === 429 || (resp.status >= 500 && resp.status < 600)) {
+        const wait = 1000 * Math.pow(2, attempt);
+        console.warn(`[AI] ${resp.status} on attempt ${attempt + 1}, retrying in ${wait}ms`);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+
+      if (!resp.ok) {
+        console.error(`[AI] Classification failed: ${resp.status} ${await resp.text().catch(() => "")}`);
+        return null;
+      }
+
+      const data = await resp.json();
+      const toolCall = data.choices?.[0]?.message?.tool_calls?.[0];
+      if (!toolCall?.function?.arguments) {
+        console.error('[AI] No tool call in response');
+        return null;
+      }
+      return JSON.parse(toolCall.function.arguments) as AIClassification;
+    } catch (e) {
+      console.error(`[AI] Attempt ${attempt + 1} error:`, e);
+      if (attempt === 2) return null;
+      await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
     }
-    return JSON.parse(toolCall.function.arguments) as AIClassification;
-  } catch (e) {
-    console.error('[AI] Classification error:', e);
-    return null;
   }
+  return null;
 }
 
 // ============ UTILITY FUNCTIONS ============
@@ -669,6 +687,57 @@ async function isDuplicateEvent(
 
 const FIRECRAWL_API_URL = "https://api.firecrawl.dev/v1";
 
+// Parse JSON-LD Event blocks out of raw HTML — works for lu.ma, eventbrite, meetup, etc.
+function extractJsonLdEvent(rawHtml: string): {
+  event_date: string | null;
+  event_time: string | null;
+  end_date: string | null;
+  venue: string | null;
+  city: string | null;
+  organizer: string | null;
+  is_online: boolean;
+  title: string | null;
+  description: string | null;
+} {
+  const empty = {
+    event_date: null, event_time: null, end_date: null,
+    venue: null, city: null, organizer: null, is_online: false,
+    title: null, description: null,
+  };
+  if (!rawHtml) return empty;
+  try {
+    const matches = rawHtml.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi);
+    for (const m of matches) {
+      try {
+        const ld = JSON.parse(m[1].trim());
+        const items = Array.isArray(ld) ? ld : (ld['@graph'] || [ld]);
+        for (const item of items) {
+          const t = item['@type'];
+          const isEvent = t === 'Event' || (Array.isArray(t) && t.includes('Event')) ||
+            (typeof t === 'string' && /Event$/.test(t));
+          if (!isEvent) continue;
+          const start = item.startDate ? new Date(item.startDate) : null;
+          const end = item.endDate ? new Date(item.endDate) : null;
+          const isOnline = item.eventAttendanceMode?.toString().includes('Online') ||
+            item.location?.['@type'] === 'VirtualLocation';
+          return {
+            event_date: start && !isNaN(start.getTime()) ? start.toISOString().split('T')[0] : null,
+            event_time: start && !isNaN(start.getTime()) ? start.toISOString().split('T')[1].substring(0, 8) : null,
+            end_date: end && !isNaN(end.getTime()) ? end.toISOString().split('T')[0] : null,
+            venue: item.location?.name || null,
+            city: item.location?.address?.addressLocality || item.location?.address?.addressRegion || null,
+            organizer: item.organizer?.name || (typeof item.organizer === 'string' ? item.organizer : null),
+            is_online: !!isOnline,
+            title: item.name || null,
+            description: item.description || null,
+          };
+        }
+      } catch { /* next block */ }
+    }
+  } catch { /* fall through */ }
+  return empty;
+}
+
 async function enrichLink(link: string, firecrawlApiKey: string): Promise<any | null> {
   try {
     console.log(`[Enrich] Scraping: ${link}`);
@@ -678,7 +747,8 @@ async function enrichLink(link: string, firecrawlApiKey: string): Promise<any | 
         "Authorization": `Bearer ${firecrawlApiKey}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ url: link, formats: ["markdown"] }),
+      // rawHtml gives us JSON-LD; markdown is human readable backup
+      body: JSON.stringify({ url: link, formats: ["markdown", "rawHtml"] }),
     });
 
     if (!resp.ok) {
@@ -689,10 +759,17 @@ async function enrichLink(link: string, firecrawlApiKey: string): Promise<any | 
     const data = await resp.json();
     const result = data.data || data;
     const markdown = result.markdown || "";
-    const title = result.metadata?.title || "";
-    const description = result.metadata?.description || markdown.substring(0, 1000);
+    const rawHtml = result.rawHtml || result.html || "";
+    const meta = result.metadata || {};
+
+    const ld = extractJsonLdEvent(rawHtml);
+
+    const title = ld.title || meta.title || meta.ogTitle || "";
+    const description = ld.description || meta.description || meta.ogDescription || markdown.substring(0, 1500);
 
     if (!title || title.length < 5) return null;
+
+    console.log(`[Enrich OK] "${title.substring(0, 60)}" date=${ld.event_date} venue=${ld.venue} online=${ld.is_online}`);
 
     return {
       title,
@@ -700,14 +777,16 @@ async function enrichLink(link: string, firecrawlApiKey: string): Promise<any | 
       source_url: link,
       registration_link: link,
       source_platform: "community",
-      venue: null,
-      city: null,
-      event_date: null,
-      event_time: null,
-      end_date: null,
-      organizer: null,
-      is_online: false,
+      venue: ld.venue,
+      city: ld.city,
+      event_date: ld.event_date,
+      event_time: ld.event_time,
+      end_date: ld.end_date,
+      organizer: ld.organizer,
+      is_online: ld.is_online,
       _raw_markdown: markdown,
+      // Mark date as metadata-derived so the gate trusts it
+      metadata: { event_date: ld.event_date },
     };
   } catch (e) {
     console.error('[Enrich] Error:', e);
@@ -726,15 +805,28 @@ async function discoverFromXTwitter(firecrawlApiKey: string): Promise<{
   const outboundLinks: string[] = [];
   const tweetEvents: any[] = [];
   const queries = [
-    'site:x.com "web3 event" Lagos',
+    'site:x.com "web3" Lagos OR Nigeria',
     'site:x.com "blockchain meetup" Nigeria',
-    'site:x.com "crypto meetup" Nigeria',
-    'site:x.com "web3 hackathon" Nigeria',
-    'site:x.com "twitter space" web3 Nigeria',
-    'site:x.com web3 workshop Lagos',
+    'site:x.com "twitter space" web3 Africa',
+    'site:x.com "hosting" web3 OR crypto Lagos',
+    'site:x.com "RSVP" OR "join us" crypto Nigeria',
+    'site:x.com "AMA" blockchain Africa',
   ];
 
-  for (const query of queries) {
+  // Run Firecrawl searches in parallel — was sequential, killing latency
+  const searchPromises = queries.map(query =>
+    fetch(`${FIRECRAWL_API_URL}/search`, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${firecrawlApiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ query, limit: 5, scrapeOptions: { formats: ["markdown"] } }),
+    }).then(r => r.ok ? r.json() : null).catch(() => null)
+  );
+  const searchResults = await Promise.all(searchPromises);
+
+  for (let qi = 0; qi < queries.length; qi++) {
+    const query = queries[qi];
+    const data = searchResults[qi];
+    if (!data) { console.error(`[X Discovery] Failed for "${query}"`); continue; }
     try {
       console.log(`[X Discovery] Searching: "${query}"`);
       const resp = await fetch(`${FIRECRAWL_API_URL}/search`, {
@@ -755,7 +847,6 @@ async function discoverFromXTwitter(firecrawlApiKey: string): Promise<{
         continue;
       }
 
-      const data = await resp.json();
       const results = data.data || [];
 
       for (const r of results) {
@@ -767,12 +858,9 @@ async function discoverFromXTwitter(firecrawlApiKey: string): Promise<{
 
         if (!tweetUrl.includes("x.com") && !tweetUrl.includes("twitter.com")) continue;
 
-        // 1) Extract outbound event links
         const urlMatches = text.matchAll(/https?:\/\/(?:lu\.ma|www\.eventbrite\.com|eventbrite\.com|meetup\.com|partiful\.com)[^\s")<\]]+/g);
         for (const m of urlMatches) outboundLinks.push(m[0]);
 
-        // 2) Build a tweet-native event candidate
-        // Use first non-empty meaningful line as title; full text as description
         const cleanedTitle = (title || desc.split("\n")[0] || md.split("\n").find(l => l.trim().length > 20) || "").trim().substring(0, 240);
         if (cleanedTitle.length < 10) continue;
 
@@ -782,17 +870,10 @@ async function discoverFromXTwitter(firecrawlApiKey: string): Promise<{
           source_url: tweetUrl,
           registration_link: tweetUrl,
           source_platform: "x",
-          venue: null,
-          city: null,
-          event_date: null,
-          event_time: null,
-          end_date: null,
-          organizer: null,
+          venue: null, city: null, event_date: null, event_time: null, end_date: null, organizer: null,
           is_online: /twitter\s+space|x\s+space|virtual|online|zoom|gmeet|google\s+meet/i.test(text),
         });
       }
-
-      await new Promise(r => setTimeout(r, 500));
     } catch (e) {
       console.error(`[X Discovery] Error:`, e);
     }
@@ -824,50 +905,32 @@ async function scrapeLumaEvents(firecrawlApiKey: string): Promise<any[]> {
   ];
 
   const seen = new Set<string>();
-  for (const query of queries) {
-    try {
-      console.log(`[Luma] Firecrawl search: "${query}"`);
-      const resp = await fetch(`${FIRECRAWL_API_URL}/search`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${firecrawlApiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ query, limit: 5 }),
+  // Parallelize Luma searches
+  const searchResults = await Promise.all(queries.map(query =>
+    fetch(`${FIRECRAWL_API_URL}/search`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${firecrawlApiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, limit: 5 }),
+    }).then(r => r.ok ? r.json() : null).catch(() => null)
+  ));
+  for (const data of searchResults) {
+    if (!data) continue;
+    const results = data.data || [];
+    for (const r of results) {
+      const url: string = r.url || r.metadata?.sourceURL || '';
+      if (!/^https?:\/\/lu\.ma\/[a-z0-9-]{4,}$/i.test(url)) continue;
+      if (seen.has(url)) continue;
+      seen.add(url);
+      const title: string = r.title || r.metadata?.title || '';
+      const description: string = r.description || r.metadata?.description || '';
+      if (!title || title.length < 5) continue;
+      events.push({
+        title, description,
+        event_date: null, event_time: null, end_date: null,
+        venue: null, city: null,
+        registration_link: url, source_url: url,
+        source_platform: 'luma', is_online: false, organizer: null,
       });
-      if (!resp.ok) {
-        console.warn(`[Luma] Search failed for "${query}" (${resp.status})`);
-        continue;
-      }
-      const data = await resp.json();
-      const results = data.data || [];
-      for (const r of results) {
-        const url: string = r.url || r.metadata?.sourceURL || '';
-        // Only individual event pages, not profile/group pages
-        if (!/^https?:\/\/lu\.ma\/[a-z0-9-]{4,}$/i.test(url)) continue;
-        if (seen.has(url)) continue;
-        seen.add(url);
-        const title: string = r.title || r.metadata?.title || '';
-        const description: string = r.description || r.metadata?.description || '';
-        if (!title || title.length < 5) continue;
-        events.push({
-          title,
-          description,
-          event_date: null, // will be resolved by enrichLink + AI
-          event_time: null,
-          end_date: null,
-          venue: null,
-          city: null,
-          registration_link: url,
-          source_url: url,
-          source_platform: 'luma',
-          is_online: false,
-          organizer: null,
-        });
-      }
-      await new Promise(r => setTimeout(r, 400));
-    } catch (e) {
-      console.error(`[Luma] Error for "${query}":`, e);
     }
   }
   console.log(`[Luma] Discovered ${events.length} candidate event pages`);
@@ -1197,38 +1260,59 @@ Deno.serve(async () => {
     results.eventbrite.found = eventbriteEvents.length;
     results.meetup.found = meetupEvents.length;
 
-    // Enrich Luma candidates with full page content (date/venue live in JSON-LD/metadata)
+    // Enrich Luma candidates in PARALLEL (date/venue live in JSON-LD)
     const enrichedLuma: any[] = [];
     if (firecrawlApiKey && lumaEvents.length > 0) {
-      for (const lev of lumaEvents.slice(0, 8)) {
-        const enriched = await enrichLink(lev.source_url, firecrawlApiKey);
+      const slice = lumaEvents.slice(0, 8);
+      const enrichedAll = await Promise.all(
+        slice.map(lev => enrichLink(lev.source_url, firecrawlApiKey).catch(() => null))
+      );
+      for (let i = 0; i < slice.length; i++) {
+        const enriched = enrichedAll[i];
         if (enriched) {
           enriched.source_platform = "luma";
-          enriched.title = enriched.title || lev.title;
+          enriched.title = enriched.title || slice[i].title;
           enrichedLuma.push(enriched);
         } else {
-          // Keep the lightweight candidate so the AI still gets a shot
-          enrichedLuma.push(lev);
+          enrichedLuma.push(slice[i]);
         }
       }
     }
 
     // ---- Phase 1b: X/Twitter discovery (DUAL OUTPUT) ----
-    let xDiscoveredEvents: any[] = []; // enriched outbound (structured)
-    let xTweetEvents: any[] = [];      // tweet-native (discovery)
+    let xDiscoveredEvents: any[] = [];
+    let xTweetEvents: any[] = [];
     if (firecrawlApiKey) {
       try {
         const { outboundLinks, tweetEvents } = await discoverFromXTwitter(firecrawlApiKey);
         console.log(`[X Discovery] outbound=${outboundLinks.length} tweetEvents=${tweetEvents.length}`);
         results.x_discovery.found = outboundLinks.length;
         results.x.found = tweetEvents.length;
-        xTweetEvents = tweetEvents;
 
-        for (const link of outboundLinks.slice(0, 8)) {
-          const enriched = await enrichLink(link, firecrawlApiKey);
-          if (enriched) {
-            enriched.source_platform = "x_discovery";
-            xDiscoveredEvents.push(enriched);
+        // Enrich top 5 tweets in PARALLEL
+        const topTweets = tweetEvents.slice(0, 5);
+        const enrichedTweets = await Promise.all(
+          topTweets.map(t => enrichLink(t.source_url, firecrawlApiKey).catch(() => null))
+        );
+        for (let i = 0; i < topTweets.length; i++) {
+          const en = enrichedTweets[i];
+          if (en && en.description && en.description.length > topTweets[i].description.length) {
+            xTweetEvents.push({ ...topTweets[i], description: en.description, title: topTweets[i].title || en.title });
+          } else {
+            xTweetEvents.push(topTweets[i]);
+          }
+        }
+        xTweetEvents.push(...tweetEvents.slice(5));
+
+        // Enrich outbound links in PARALLEL (top 5)
+        const outSlice = outboundLinks.slice(0, 5);
+        const enrichedOut = await Promise.all(
+          outSlice.map(l => enrichLink(l, firecrawlApiKey).catch(() => null))
+        );
+        for (const en of enrichedOut) {
+          if (en) {
+            en.source_platform = "x_discovery";
+            xDiscoveredEvents.push(en);
           }
         }
       } catch (e) {
