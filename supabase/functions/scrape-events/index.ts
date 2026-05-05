@@ -905,50 +905,32 @@ async function scrapeLumaEvents(firecrawlApiKey: string): Promise<any[]> {
   ];
 
   const seen = new Set<string>();
-  for (const query of queries) {
-    try {
-      console.log(`[Luma] Firecrawl search: "${query}"`);
-      const resp = await fetch(`${FIRECRAWL_API_URL}/search`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${firecrawlApiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ query, limit: 5 }),
+  // Parallelize Luma searches
+  const searchResults = await Promise.all(queries.map(query =>
+    fetch(`${FIRECRAWL_API_URL}/search`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${firecrawlApiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, limit: 5 }),
+    }).then(r => r.ok ? r.json() : null).catch(() => null)
+  ));
+  for (const data of searchResults) {
+    if (!data) continue;
+    const results = data.data || [];
+    for (const r of results) {
+      const url: string = r.url || r.metadata?.sourceURL || '';
+      if (!/^https?:\/\/lu\.ma\/[a-z0-9-]{4,}$/i.test(url)) continue;
+      if (seen.has(url)) continue;
+      seen.add(url);
+      const title: string = r.title || r.metadata?.title || '';
+      const description: string = r.description || r.metadata?.description || '';
+      if (!title || title.length < 5) continue;
+      events.push({
+        title, description,
+        event_date: null, event_time: null, end_date: null,
+        venue: null, city: null,
+        registration_link: url, source_url: url,
+        source_platform: 'luma', is_online: false, organizer: null,
       });
-      if (!resp.ok) {
-        console.warn(`[Luma] Search failed for "${query}" (${resp.status})`);
-        continue;
-      }
-      const data = await resp.json();
-      const results = data.data || [];
-      for (const r of results) {
-        const url: string = r.url || r.metadata?.sourceURL || '';
-        // Only individual event pages, not profile/group pages
-        if (!/^https?:\/\/lu\.ma\/[a-z0-9-]{4,}$/i.test(url)) continue;
-        if (seen.has(url)) continue;
-        seen.add(url);
-        const title: string = r.title || r.metadata?.title || '';
-        const description: string = r.description || r.metadata?.description || '';
-        if (!title || title.length < 5) continue;
-        events.push({
-          title,
-          description,
-          event_date: null, // will be resolved by enrichLink + AI
-          event_time: null,
-          end_date: null,
-          venue: null,
-          city: null,
-          registration_link: url,
-          source_url: url,
-          source_platform: 'luma',
-          is_online: false,
-          organizer: null,
-        });
-      }
-      await new Promise(r => setTimeout(r, 400));
-    } catch (e) {
-      console.error(`[Luma] Error for "${query}":`, e);
     }
   }
   console.log(`[Luma] Discovered ${events.length} candidate event pages`);
