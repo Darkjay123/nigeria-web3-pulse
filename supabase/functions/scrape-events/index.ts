@@ -847,7 +847,6 @@ async function discoverFromXTwitter(firecrawlApiKey: string): Promise<{
         continue;
       }
 
-      const data = await resp.json();
       const results = data.data || [];
 
       for (const r of results) {
@@ -859,12 +858,9 @@ async function discoverFromXTwitter(firecrawlApiKey: string): Promise<{
 
         if (!tweetUrl.includes("x.com") && !tweetUrl.includes("twitter.com")) continue;
 
-        // 1) Extract outbound event links
         const urlMatches = text.matchAll(/https?:\/\/(?:lu\.ma|www\.eventbrite\.com|eventbrite\.com|meetup\.com|partiful\.com)[^\s")<\]]+/g);
         for (const m of urlMatches) outboundLinks.push(m[0]);
 
-        // 2) Build a tweet-native event candidate
-        // Use first non-empty meaningful line as title; full text as description
         const cleanedTitle = (title || desc.split("\n")[0] || md.split("\n").find(l => l.trim().length > 20) || "").trim().substring(0, 240);
         if (cleanedTitle.length < 10) continue;
 
@@ -874,17 +870,10 @@ async function discoverFromXTwitter(firecrawlApiKey: string): Promise<{
           source_url: tweetUrl,
           registration_link: tweetUrl,
           source_platform: "x",
-          venue: null,
-          city: null,
-          event_date: null,
-          event_time: null,
-          end_date: null,
-          organizer: null,
+          venue: null, city: null, event_date: null, event_time: null, end_date: null, organizer: null,
           is_online: /twitter\s+space|x\s+space|virtual|online|zoom|gmeet|google\s+meet/i.test(text),
         });
       }
-
-      await new Promise(r => setTimeout(r, 500));
     } catch (e) {
       console.error(`[X Discovery] Error:`, e);
     }
