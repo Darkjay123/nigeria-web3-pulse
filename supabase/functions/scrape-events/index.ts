@@ -476,41 +476,52 @@ Description: ${(event.description || "").substring(0, 1500)}`;
     },
   }];
 
-  try {
-    const resp = await fetch(AI_GATEWAY_URL, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "google/gemini-2.5-flash",
-        messages: [
-          { role: "system", content: "You are an event classification engine. Be strict. Reject anything that is not a single, specific Web3 event. Bias toward rejection when in doubt." },
-          { role: "user", content: userPrompt },
-        ],
-        tools,
-        tool_choice: { type: "function", function: { name: "classify_event" } },
-        temperature: 0.0,
-      }),
-    });
+  const body = JSON.stringify({
+    model: "google/gemini-2.5-flash",
+    messages: [
+      { role: "system", content: "You are an event classification engine. Be strict. Reject anything that is not a single, specific Web3 event. Bias toward rejection when in doubt." },
+      { role: "user", content: userPrompt },
+    ],
+    tools,
+    tool_choice: { type: "function", function: { name: "classify_event" } },
+    temperature: 0.0,
+  });
 
-    if (!resp.ok) {
-      console.error(`[AI] Classification failed: ${resp.status} ${await resp.text().catch(() => "")}`);
-      return null;
-    }
+  // Retry up to 2 times on 429/5xx with exponential backoff
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const resp = await fetch(AI_GATEWAY_URL, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body,
+      });
 
-    const data = await resp.json();
-    const toolCall = data.choices?.[0]?.message?.tool_calls?.[0];
-    if (!toolCall?.function?.arguments) {
-      console.error('[AI] No tool call in response');
-      return null;
+      if (resp.status === 429 || (resp.status >= 500 && resp.status < 600)) {
+        const wait = 1000 * Math.pow(2, attempt);
+        console.warn(`[AI] ${resp.status} on attempt ${attempt + 1}, retrying in ${wait}ms`);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+
+      if (!resp.ok) {
+        console.error(`[AI] Classification failed: ${resp.status} ${await resp.text().catch(() => "")}`);
+        return null;
+      }
+
+      const data = await resp.json();
+      const toolCall = data.choices?.[0]?.message?.tool_calls?.[0];
+      if (!toolCall?.function?.arguments) {
+        console.error('[AI] No tool call in response');
+        return null;
+      }
+      return JSON.parse(toolCall.function.arguments) as AIClassification;
+    } catch (e) {
+      console.error(`[AI] Attempt ${attempt + 1} error:`, e);
+      if (attempt === 2) return null;
+      await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
     }
-    return JSON.parse(toolCall.function.arguments) as AIClassification;
-  } catch (e) {
-    console.error('[AI] Classification error:', e);
-    return null;
   }
+  return null;
 }
 
 // ============ UTILITY FUNCTIONS ============
