@@ -813,7 +813,20 @@ async function discoverFromXTwitter(firecrawlApiKey: string): Promise<{
     'site:x.com "AMA" blockchain Africa',
   ];
 
-  for (const query of queries) {
+  // Run Firecrawl searches in parallel — was sequential, killing latency
+  const searchPromises = queries.map(query =>
+    fetch(`${FIRECRAWL_API_URL}/search`, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${firecrawlApiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ query, limit: 5, scrapeOptions: { formats: ["markdown"] } }),
+    }).then(r => r.ok ? r.json() : null).catch(() => null)
+  );
+  const searchResults = await Promise.all(searchPromises);
+
+  for (let qi = 0; qi < queries.length; qi++) {
+    const query = queries[qi];
+    const data = searchResults[qi];
+    if (!data) { console.error(`[X Discovery] Failed for "${query}"`); continue; }
     try {
       console.log(`[X Discovery] Searching: "${query}"`);
       const resp = await fetch(`${FIRECRAWL_API_URL}/search`, {
