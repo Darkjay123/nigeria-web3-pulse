@@ -1309,7 +1309,27 @@ Deno.serve(async () => {
         console.log(`[X Discovery] outbound=${outboundLinks.length} tweetEvents=${tweetEvents.length}`);
         results.x_discovery.found = outboundLinks.length;
         results.x.found = tweetEvents.length;
-        xTweetEvents = tweetEvents;
+
+        // Enrich top 10 tweets with full page body — gives intent regex more text to work with
+        xTweetEvents = [];
+        for (const tev of tweetEvents.slice(0, 10)) {
+          try {
+            const enriched = await enrichLink(tev.source_url, firecrawlApiKey);
+            if (enriched && enriched.description && enriched.description.length > tev.description.length) {
+              xTweetEvents.push({
+                ...tev,
+                description: enriched.description,
+                title: tev.title || enriched.title,
+              });
+            } else {
+              xTweetEvents.push(tev);
+            }
+          } catch {
+            xTweetEvents.push(tev);
+          }
+        }
+        // keep remaining un-enriched as-is
+        xTweetEvents.push(...tweetEvents.slice(10));
 
         for (const link of outboundLinks.slice(0, 8)) {
           const enriched = await enrichLink(link, firecrawlApiKey);
