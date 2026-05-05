@@ -805,20 +805,12 @@ async function discoverFromXTwitter(firecrawlApiKey: string): Promise<{
   const outboundLinks: string[] = [];
   const tweetEvents: any[] = [];
   const queries = [
-    'site:x.com "web3 event" Lagos',
+    'site:x.com "web3" Lagos OR Nigeria',
     'site:x.com "blockchain meetup" Nigeria',
-    'site:x.com "crypto meetup" Nigeria',
-    'site:x.com "web3 hackathon" Nigeria',
-    'site:x.com "twitter space" web3 Nigeria',
-    'site:x.com web3 workshop Lagos',
-    // Behavioral / natural-language queries (v10)
-    'site:x.com "hosting a web3" Nigeria',
-    'site:x.com "join us" web3 Lagos',
-    'site:x.com "RSVP" crypto Nigeria',
+    'site:x.com "twitter space" web3 Africa',
+    'site:x.com "hosting" web3 OR crypto Lagos',
+    'site:x.com "RSVP" OR "join us" crypto Nigeria',
     'site:x.com "AMA" blockchain Africa',
-    'site:x.com "spaces tonight" web3',
-    'site:x.com "this saturday" crypto Lagos',
-    'site:x.com "register" web3 Africa',
   ];
 
   for (const query of queries) {
