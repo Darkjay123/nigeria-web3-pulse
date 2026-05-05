@@ -669,6 +669,57 @@ async function isDuplicateEvent(
 
 const FIRECRAWL_API_URL = "https://api.firecrawl.dev/v1";
 
+// Parse JSON-LD Event blocks out of raw HTML — works for lu.ma, eventbrite, meetup, etc.
+function extractJsonLdEvent(rawHtml: string): {
+  event_date: string | null;
+  event_time: string | null;
+  end_date: string | null;
+  venue: string | null;
+  city: string | null;
+  organizer: string | null;
+  is_online: boolean;
+  title: string | null;
+  description: string | null;
+} {
+  const empty = {
+    event_date: null, event_time: null, end_date: null,
+    venue: null, city: null, organizer: null, is_online: false,
+    title: null, description: null,
+  };
+  if (!rawHtml) return empty;
+  try {
+    const matches = rawHtml.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi);
+    for (const m of matches) {
+      try {
+        const ld = JSON.parse(m[1].trim());
+        const items = Array.isArray(ld) ? ld : (ld['@graph'] || [ld]);
+        for (const item of items) {
+          const t = item['@type'];
+          const isEvent = t === 'Event' || (Array.isArray(t) && t.includes('Event')) ||
+            (typeof t === 'string' && /Event$/.test(t));
+          if (!isEvent) continue;
+          const start = item.startDate ? new Date(item.startDate) : null;
+          const end = item.endDate ? new Date(item.endDate) : null;
+          const isOnline = item.eventAttendanceMode?.toString().includes('Online') ||
+            item.location?.['@type'] === 'VirtualLocation';
+          return {
+            event_date: start && !isNaN(start.getTime()) ? start.toISOString().split('T')[0] : null,
+            event_time: start && !isNaN(start.getTime()) ? start.toISOString().split('T')[1].substring(0, 8) : null,
+            end_date: end && !isNaN(end.getTime()) ? end.toISOString().split('T')[0] : null,
+            venue: item.location?.name || null,
+            city: item.location?.address?.addressLocality || item.location?.address?.addressRegion || null,
+            organizer: item.organizer?.name || (typeof item.organizer === 'string' ? item.organizer : null),
+            is_online: !!isOnline,
+            title: item.name || null,
+            description: item.description || null,
+          };
+        }
+      } catch { /* next block */ }
+    }
+  } catch { /* fall through */ }
+  return empty;
+}
+
 async function enrichLink(link: string, firecrawlApiKey: string): Promise<any | null> {
   try {
     console.log(`[Enrich] Scraping: ${link}`);
@@ -678,7 +729,8 @@ async function enrichLink(link: string, firecrawlApiKey: string): Promise<any | 
         "Authorization": `Bearer ${firecrawlApiKey}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ url: link, formats: ["markdown"] }),
+      // rawHtml gives us JSON-LD; markdown is human readable backup
+      body: JSON.stringify({ url: link, formats: ["markdown", "rawHtml"] }),
     });
 
     if (!resp.ok) {
@@ -689,10 +741,17 @@ async function enrichLink(link: string, firecrawlApiKey: string): Promise<any | 
     const data = await resp.json();
     const result = data.data || data;
     const markdown = result.markdown || "";
-    const title = result.metadata?.title || "";
-    const description = result.metadata?.description || markdown.substring(0, 1000);
+    const rawHtml = result.rawHtml || result.html || "";
+    const meta = result.metadata || {};
+
+    const ld = extractJsonLdEvent(rawHtml);
+
+    const title = ld.title || meta.title || meta.ogTitle || "";
+    const description = ld.description || meta.description || meta.ogDescription || markdown.substring(0, 1500);
 
     if (!title || title.length < 5) return null;
+
+    console.log(`[Enrich OK] "${title.substring(0, 60)}" date=${ld.event_date} venue=${ld.venue} online=${ld.is_online}`);
 
     return {
       title,
@@ -700,14 +759,16 @@ async function enrichLink(link: string, firecrawlApiKey: string): Promise<any | 
       source_url: link,
       registration_link: link,
       source_platform: "community",
-      venue: null,
-      city: null,
-      event_date: null,
-      event_time: null,
-      end_date: null,
-      organizer: null,
-      is_online: false,
+      venue: ld.venue,
+      city: ld.city,
+      event_date: ld.event_date,
+      event_time: ld.event_time,
+      end_date: ld.end_date,
+      organizer: ld.organizer,
+      is_online: ld.is_online,
       _raw_markdown: markdown,
+      // Mark date as metadata-derived so the gate trusts it
+      metadata: { event_date: ld.event_date },
     };
   } catch (e) {
     console.error('[Enrich] Error:', e);
