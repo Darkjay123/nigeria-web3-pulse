@@ -1284,25 +1284,28 @@ Deno.serve(async () => {
     results.eventbrite.found = eventbriteEvents.length;
     results.meetup.found = meetupEvents.length;
 
-    // Enrich Luma candidates with full page content (date/venue live in JSON-LD/metadata)
+    // Enrich Luma candidates in PARALLEL (date/venue live in JSON-LD)
     const enrichedLuma: any[] = [];
     if (firecrawlApiKey && lumaEvents.length > 0) {
-      for (const lev of lumaEvents.slice(0, 8)) {
-        const enriched = await enrichLink(lev.source_url, firecrawlApiKey);
+      const slice = lumaEvents.slice(0, 8);
+      const enrichedAll = await Promise.all(
+        slice.map(lev => enrichLink(lev.source_url, firecrawlApiKey).catch(() => null))
+      );
+      for (let i = 0; i < slice.length; i++) {
+        const enriched = enrichedAll[i];
         if (enriched) {
           enriched.source_platform = "luma";
-          enriched.title = enriched.title || lev.title;
+          enriched.title = enriched.title || slice[i].title;
           enrichedLuma.push(enriched);
         } else {
-          // Keep the lightweight candidate so the AI still gets a shot
-          enrichedLuma.push(lev);
+          enrichedLuma.push(slice[i]);
         }
       }
     }
 
     // ---- Phase 1b: X/Twitter discovery (DUAL OUTPUT) ----
-    let xDiscoveredEvents: any[] = []; // enriched outbound (structured)
-    let xTweetEvents: any[] = [];      // tweet-native (discovery)
+    let xDiscoveredEvents: any[] = [];
+    let xTweetEvents: any[] = [];
     if (firecrawlApiKey) {
       try {
         const { outboundLinks, tweetEvents } = await discoverFromXTwitter(firecrawlApiKey);
@@ -1310,32 +1313,30 @@ Deno.serve(async () => {
         results.x_discovery.found = outboundLinks.length;
         results.x.found = tweetEvents.length;
 
-        // Enrich top 10 tweets with full page body — gives intent regex more text to work with
-        xTweetEvents = [];
-        for (const tev of tweetEvents.slice(0, 10)) {
-          try {
-            const enriched = await enrichLink(tev.source_url, firecrawlApiKey);
-            if (enriched && enriched.description && enriched.description.length > tev.description.length) {
-              xTweetEvents.push({
-                ...tev,
-                description: enriched.description,
-                title: tev.title || enriched.title,
-              });
-            } else {
-              xTweetEvents.push(tev);
-            }
-          } catch {
-            xTweetEvents.push(tev);
+        // Enrich top 5 tweets in PARALLEL
+        const topTweets = tweetEvents.slice(0, 5);
+        const enrichedTweets = await Promise.all(
+          topTweets.map(t => enrichLink(t.source_url, firecrawlApiKey).catch(() => null))
+        );
+        for (let i = 0; i < topTweets.length; i++) {
+          const en = enrichedTweets[i];
+          if (en && en.description && en.description.length > topTweets[i].description.length) {
+            xTweetEvents.push({ ...topTweets[i], description: en.description, title: topTweets[i].title || en.title });
+          } else {
+            xTweetEvents.push(topTweets[i]);
           }
         }
-        // keep remaining un-enriched as-is
-        xTweetEvents.push(...tweetEvents.slice(10));
+        xTweetEvents.push(...tweetEvents.slice(5));
 
-        for (const link of outboundLinks.slice(0, 8)) {
-          const enriched = await enrichLink(link, firecrawlApiKey);
-          if (enriched) {
-            enriched.source_platform = "x_discovery";
-            xDiscoveredEvents.push(enriched);
+        // Enrich outbound links in PARALLEL (top 5)
+        const outSlice = outboundLinks.slice(0, 5);
+        const enrichedOut = await Promise.all(
+          outSlice.map(l => enrichLink(l, firecrawlApiKey).catch(() => null))
+        );
+        for (const en of enrichedOut) {
+          if (en) {
+            en.source_platform = "x_discovery";
+            xDiscoveredEvents.push(en);
           }
         }
       } catch (e) {
