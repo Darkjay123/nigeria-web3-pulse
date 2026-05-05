@@ -265,6 +265,13 @@ const EVENT_INTENT_PATTERNS: RegExp[] = [
   /\bsign\s+up\b/i,
   /\bstarts?\s+(?:in|at|on)\b/i,
   /\bhappening\s+(?:on|this|tomorrow|today|tonight)\b/i,
+  // v10 — CTA / urgency
+  /\bdm\s+(?:to|me|us)\b/i,
+  /\blink\s+in\s+bio\b/i,
+  /\bregister\s+here\b/i,
+  /\bclick\s+(?:to|here)\s+(?:join|register|rsvp)\b/i,
+  /\b(?:tonight|today|tomorrow)\b.{0,30}\b(?:web3|crypto|blockchain|defi|nft|spaces?|ama|meetup)\b/i,
+  /\b(?:web3|crypto|blockchain|defi|nft|spaces?|ama|meetup)\b.{0,30}\b(?:tonight|today|tomorrow|this\s+(?:sat|sun|mon|tue|wed|thu|fri))/i,
 ];
 
 function hasEventIntent(text: string): boolean {
