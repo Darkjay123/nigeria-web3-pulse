@@ -38,17 +38,41 @@ function SubmitPage() {
     }
 
     setLoading(true);
-    const { error } = await supabase.from("user_submitted_events").insert({
+    const { error: subErr } = await supabase.from("user_submitted_events").insert({
       link: parsed.data.link,
       raw_text: parsed.data.raw_text || null,
       submission_count: 1,
     });
+
+    // Also surface immediately on the dashboard as pending_review
+    let derivedTitle = parsed.data.raw_text?.slice(0, 80);
+    if (!derivedTitle) {
+      try {
+        const u = new URL(parsed.data.link);
+        derivedTitle = `Submitted event — ${u.hostname.replace(/^www\./, "")}`;
+      } catch {
+        derivedTitle = "Submitted event";
+      }
+    }
+    const { error: evtErr } = await supabase.from("events").insert({
+      title: derivedTitle,
+      description: parsed.data.raw_text || null,
+      state: "Unknown",
+      country: "Nigeria",
+      source_url: parsed.data.link,
+      registration_link: parsed.data.link,
+      source_platform: "community",
+      event_type: "other" as "other",
+      status: "pending_review" as "pending_review",
+      confidence_score: 0.5,
+    });
+
     setLoading(false);
 
-    if (error) {
-      toast.error("Submission failed: " + error.message);
+    if (subErr && evtErr) {
+      toast.error("Submission failed: " + (subErr.message || evtErr.message));
     } else {
-      toast.success("Thanks! Your event will be reviewed by our pipeline.");
+      toast.success("Thanks! Your event is now pending review.");
       setLink("");
       setNotes("");
     }

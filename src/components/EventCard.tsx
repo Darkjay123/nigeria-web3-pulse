@@ -34,6 +34,11 @@ export function EventCard({ event }: { event: Event }) {
                 <Globe className="mr-1 h-3 w-3" /> Online
               </Badge>
             )}
+            {event.status === "pending_review" && (
+              <Badge variant="outline" className="border-chart-4/30 bg-chart-4/10 text-chart-4">
+                Pending review
+              </Badge>
+            )}
           </div>
           {event.confidence_score && (
             <span className="shrink-0 text-xs text-muted-foreground">
