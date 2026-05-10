@@ -1396,6 +1396,18 @@ Deno.serve(async () => {
     let submissionsProcessed = 0, submissionsAccepted = 0;
     if (submissions && submissions.length > 0 && firecrawlApiKey) {
       for (const sub of submissions) {
+        // Find any pending_review placeholder created by /submit for this link
+        let upgradeId: string | undefined;
+        if (sub.link) {
+          const { data: placeholder } = await supabase
+            .from('events')
+            .select('id')
+            .eq('source_url', sub.link)
+            .eq('status', 'pending_review')
+            .maybeSingle();
+          upgradeId = placeholder?.id;
+        }
+
         let enrichedEvent: any = null;
         if (sub.link) {
           enrichedEvent = await enrichLink(sub.link, firecrawlApiKey);
@@ -1404,8 +1416,13 @@ Deno.serve(async () => {
         if (enrichedEvent) {
           enrichedEvent._submission_count = sub.submission_count;
           const subStats = emptyStats();
-          const accepted = await processEvent(enrichedEvent, 'community', supabase, lovableApiKey, subStats);
+          const accepted = await processEvent(enrichedEvent, 'community', supabase, lovableApiKey, subStats, { upgradeId });
           if (accepted) submissionsAccepted++;
+        } else if (upgradeId) {
+          // Could not enrich — mark placeholder rejected so it doesn't sit forever
+          await supabase.from('events')
+            .update({ status: 'rejected', description: 'Unable to fetch event page for validation.' })
+            .eq('id', upgradeId);
         }
 
         await supabase.from('user_submitted_events')
