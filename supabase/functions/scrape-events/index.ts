@@ -1084,11 +1084,24 @@ async function processEvent(
   sourceName: string,
   supabase: any,
   lovableApiKey: string,
-  stats: any
+  stats: any,
+  options: { upgradeId?: string } = {}
 ): Promise<boolean> {
+  const upgradeId = options.upgradeId;
+  // Helper: when running in "submission upgrade" mode, mark placeholder rejected on any drop.
+  const rejectPlaceholder = async (reason: string) => {
+    if (!upgradeId) return;
+    await supabase.from('events')
+      .update({ status: 'rejected', description: reason.slice(0, 2000) })
+      .eq('id', upgradeId);
+  };
+
   // STAGE 0: NORMALIZE — uniform shape, metadata-aware date extraction
   const ev = normalizeEvent(raw);
-  if (!ev.title || ev.title.length < 5) return false;
+  if (!ev.title || ev.title.length < 5) {
+    await rejectPlaceholder('Title missing or too short after enrichment.');
+    return false;
+  }
 
   const fullText = `${ev.title} ${ev.description} ${ev.venue || ''} ${ev.city || ''}`;
 
@@ -1097,6 +1110,7 @@ async function processEvent(
   if (!gate.pass) {
     stats.filtered_gate++;
     console.log(`[GATE REJECT] "${ev.title}" — ${gate.reason}`);
+    await rejectPlaceholder(`Rejected by page-type gate: ${gate.reason}`);
     return false;
   }
 
@@ -1106,46 +1120,46 @@ async function processEvent(
   if (kwScore < kwThreshold) {
     stats.filtered_keyword++;
     console.log(`[KEYWORD REJECT] "${ev.title}" (score=${kwScore}, need=${kwThreshold}, mode=${ev.source_type})`);
+    await rejectPlaceholder(`Not enough Web3 signal in content (score ${kwScore}/${kwThreshold}).`);
     return false;
   }
 
-  // STAGE 2b (DISCOVERY ONLY): Intent + signal-score gate — kills tweets with no
-  // event intent (recaps, news, brand chatter) BEFORE we spend AI tokens on them.
+  // STAGE 2b (DISCOVERY ONLY): Intent + signal-score gate
   if (ev.source_type === "discovery") {
     const sig = discoverySignalScore(ev, fullText);
     if (!sig.intent) {
       stats.filtered_keyword++;
       console.log(`[DISCOVERY REJECT] "${ev.title}" — no intent signal (score=${sig.score}, web3=${sig.web3} time=${sig.time} platform=${sig.platform})`);
+      await rejectPlaceholder('No event intent signal found.');
       return false;
     }
     if (sig.score < 2) {
       stats.filtered_keyword++;
       console.log(`[DISCOVERY REJECT] "${ev.title}" — low score=${sig.score} (need ≥2)`);
+      await rejectPlaceholder(`Discovery signal too low (${sig.score}/2).`);
       return false;
     }
-    // Past-date short-circuit — ONLY trust metadata dates here. Text-extracted dates
-    // in tweets are noisy (random YYYY-MM-DD substrings, embedded timestamps).
-    // The AI will resolve the real date later; finalValidate will reject if past.
     if (ev.has_metadata_date && isPastDate(ev.event_date)) {
       stats.filtered_gate++;
       console.log(`[DISCOVERY REJECT] "${ev.title}" — past metadata date ${ev.event_date}`);
+      await rejectPlaceholder(`Event date is in the past (${ev.event_date}).`);
       return false;
     }
     console.log(`[DISCOVERY PASS] "${ev.title.substring(0, 60)}" score=${sig.score} intent=${sig.intent} time=${sig.time} platform=${sig.platform}`);
   } else {
-    // Structured: short-circuit on past metadata dates only.
-    // (Text-extracted dates from enriched markdown are unreliable; let AI resolve.)
     if (ev.has_metadata_date && isPastDate(ev.event_date)) {
       stats.filtered_gate++;
       console.log(`[GATE REJECT] "${ev.title}" — past metadata date ${ev.event_date}`);
+      await rejectPlaceholder(`Event date is in the past (${ev.event_date}).`);
       return false;
     }
   }
 
-  // STAGE 3: AI classification (CLASSIFICATION ONLY — no enforcement here)
+  // STAGE 3: AI classification
   if (!lovableApiKey) {
     stats.filtered_ai++;
     console.log(`[AI SKIP-REJECT] "${ev.title}" — no AI key`);
+    await rejectPlaceholder('AI classifier unavailable.');
     return false;
   }
 
@@ -1158,15 +1172,17 @@ async function processEvent(
   if (!aiResult) {
     stats.filtered_ai++;
     console.log(`[AI REJECT] "${ev.title}" — classifier failed`);
+    await rejectPlaceholder('AI classifier failed to return a verdict.');
     return false;
   }
 
-  // STAGE 4: FINAL VALIDATOR (single source of truth)
+  // STAGE 4: FINAL VALIDATOR
   const verdict = finalValidate(ev, aiResult);
   if (!verdict.ok) {
     stats.filtered_ai++;
     const tag = ev.source_type === "discovery" ? "AI REJECT DISCOVERY" : "FINAL REJECT";
     console.log(`[${tag}] "${ev.title}" — ${verdict.reason} | AI conf=${aiResult.confidence}`);
+    await rejectPlaceholder(`AI rejected: ${verdict.reason} (confidence ${aiResult.confidence}).`);
     return false;
   }
   const acceptTag = ev.source_type === "discovery" ? "AI ACCEPT DISCOVERY" : "ACCEPT";
@@ -1183,17 +1199,19 @@ async function processEvent(
   const confidenceScore = aiResult.confidence;
   const dedupHash = await generateDedupHash(ev.title, eventDate, resolvedState);
 
-  // STAGE 5: Dedup
-  const isDupe = await isDuplicateEvent(ev.title, eventDate, ev.registration_link, ev.source_url, dedupHash, supabase);
-  if (isDupe) {
-    stats.duplicates++;
-    return false;
+  // STAGE 5: Dedup (skip when upgrading a placeholder — placeholder IS the row)
+  if (!upgradeId) {
+    const isDupe = await isDuplicateEvent(ev.title, eventDate, ev.registration_link, ev.source_url, dedupHash, supabase);
+    if (isDupe) {
+      stats.duplicates++;
+      return false;
+    }
   }
 
   const submissionCount = ev._submission_count || 0;
   const popularityScore = (submissionCount * 0.4) + (confidenceScore * 0.6);
 
-  const { error } = await supabase.from('events').insert({
+  const payload = {
     title: ev.title.substring(0, 500),
     description: ev.description?.substring(0, 2000) || null,
     city,
@@ -1211,22 +1229,24 @@ async function processEvent(
     is_online: isOnline,
     confidence_score: confidenceScore,
     dedup_hash: dedupHash,
-    status: 'upcoming',
+    status: 'upcoming' as const,
     source_platform: ev.source_platform || sourceName,
-    image_url: null,
     submission_count: submissionCount,
     popularity_score: popularityScore,
-    posted_to_telegram: false,
-  });
+  };
+
+  const { error } = upgradeId
+    ? await supabase.from('events').update(payload).eq('id', upgradeId)
+    : await supabase.from('events').insert({ ...payload, image_url: null, posted_to_telegram: false });
 
   if (error) {
-    console.error('Insert error:', error.message);
-    stats.errors += `Insert: ${error.message}; `;
+    console.error('Persist error:', error.message);
+    stats.errors += `Persist: ${error.message}; `;
     return false;
   }
 
   stats.inserted++;
-  console.log(`INSERTED: "${ev.title}" [${eventType}] confidence=${confidenceScore}`);
+  console.log(`${upgradeId ? 'UPGRADED' : 'INSERTED'}: "${ev.title}" [${eventType}] confidence=${confidenceScore}`);
   return true;
 }
 
@@ -1376,6 +1396,18 @@ Deno.serve(async () => {
     let submissionsProcessed = 0, submissionsAccepted = 0;
     if (submissions && submissions.length > 0 && firecrawlApiKey) {
       for (const sub of submissions) {
+        // Find any pending_review placeholder created by /submit for this link
+        let upgradeId: string | undefined;
+        if (sub.link) {
+          const { data: placeholder } = await supabase
+            .from('events')
+            .select('id')
+            .eq('source_url', sub.link)
+            .eq('status', 'pending_review')
+            .maybeSingle();
+          upgradeId = placeholder?.id;
+        }
+
         let enrichedEvent: any = null;
         if (sub.link) {
           enrichedEvent = await enrichLink(sub.link, firecrawlApiKey);
@@ -1384,8 +1416,13 @@ Deno.serve(async () => {
         if (enrichedEvent) {
           enrichedEvent._submission_count = sub.submission_count;
           const subStats = emptyStats();
-          const accepted = await processEvent(enrichedEvent, 'community', supabase, lovableApiKey, subStats);
+          const accepted = await processEvent(enrichedEvent, 'community', supabase, lovableApiKey, subStats, { upgradeId });
           if (accepted) submissionsAccepted++;
+        } else if (upgradeId) {
+          // Could not enrich — mark placeholder rejected so it doesn't sit forever
+          await supabase.from('events')
+            .update({ status: 'rejected', description: 'Unable to fetch event page for validation.' })
+            .eq('id', upgradeId);
         }
 
         await supabase.from('user_submitted_events')
