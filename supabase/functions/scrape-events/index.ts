@@ -1084,11 +1084,24 @@ async function processEvent(
   sourceName: string,
   supabase: any,
   lovableApiKey: string,
-  stats: any
+  stats: any,
+  options: { upgradeId?: string } = {}
 ): Promise<boolean> {
+  const upgradeId = options.upgradeId;
+  // Helper: when running in "submission upgrade" mode, mark placeholder rejected on any drop.
+  const rejectPlaceholder = async (reason: string) => {
+    if (!upgradeId) return;
+    await supabase.from('events')
+      .update({ status: 'rejected', description: reason.slice(0, 2000) })
+      .eq('id', upgradeId);
+  };
+
   // STAGE 0: NORMALIZE — uniform shape, metadata-aware date extraction
   const ev = normalizeEvent(raw);
-  if (!ev.title || ev.title.length < 5) return false;
+  if (!ev.title || ev.title.length < 5) {
+    await rejectPlaceholder('Title missing or too short after enrichment.');
+    return false;
+  }
 
   const fullText = `${ev.title} ${ev.description} ${ev.venue || ''} ${ev.city || ''}`;
 
