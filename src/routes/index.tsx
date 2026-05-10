@@ -40,6 +40,7 @@ function Index() {
     const { data, error } = await supabase
       .from("events")
       .select("*")
+      .neq("status", "rejected")
       .order("event_date", { ascending: true, nullsFirst: false });
 
     if (!error && data) {
