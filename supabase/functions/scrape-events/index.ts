@@ -1110,6 +1110,7 @@ async function processEvent(
   if (!gate.pass) {
     stats.filtered_gate++;
     console.log(`[GATE REJECT] "${ev.title}" — ${gate.reason}`);
+    await rejectPlaceholder(`Rejected by page-type gate: ${gate.reason}`);
     return false;
   }
 
@@ -1119,46 +1120,46 @@ async function processEvent(
   if (kwScore < kwThreshold) {
     stats.filtered_keyword++;
     console.log(`[KEYWORD REJECT] "${ev.title}" (score=${kwScore}, need=${kwThreshold}, mode=${ev.source_type})`);
+    await rejectPlaceholder(`Not enough Web3 signal in content (score ${kwScore}/${kwThreshold}).`);
     return false;
   }
 
-  // STAGE 2b (DISCOVERY ONLY): Intent + signal-score gate — kills tweets with no
-  // event intent (recaps, news, brand chatter) BEFORE we spend AI tokens on them.
+  // STAGE 2b (DISCOVERY ONLY): Intent + signal-score gate
   if (ev.source_type === "discovery") {
     const sig = discoverySignalScore(ev, fullText);
     if (!sig.intent) {
       stats.filtered_keyword++;
       console.log(`[DISCOVERY REJECT] "${ev.title}" — no intent signal (score=${sig.score}, web3=${sig.web3} time=${sig.time} platform=${sig.platform})`);
+      await rejectPlaceholder('No event intent signal found.');
       return false;
     }
     if (sig.score < 2) {
       stats.filtered_keyword++;
       console.log(`[DISCOVERY REJECT] "${ev.title}" — low score=${sig.score} (need ≥2)`);
+      await rejectPlaceholder(`Discovery signal too low (${sig.score}/2).`);
       return false;
     }
-    // Past-date short-circuit — ONLY trust metadata dates here. Text-extracted dates
-    // in tweets are noisy (random YYYY-MM-DD substrings, embedded timestamps).
-    // The AI will resolve the real date later; finalValidate will reject if past.
     if (ev.has_metadata_date && isPastDate(ev.event_date)) {
       stats.filtered_gate++;
       console.log(`[DISCOVERY REJECT] "${ev.title}" — past metadata date ${ev.event_date}`);
+      await rejectPlaceholder(`Event date is in the past (${ev.event_date}).`);
       return false;
     }
     console.log(`[DISCOVERY PASS] "${ev.title.substring(0, 60)}" score=${sig.score} intent=${sig.intent} time=${sig.time} platform=${sig.platform}`);
   } else {
-    // Structured: short-circuit on past metadata dates only.
-    // (Text-extracted dates from enriched markdown are unreliable; let AI resolve.)
     if (ev.has_metadata_date && isPastDate(ev.event_date)) {
       stats.filtered_gate++;
       console.log(`[GATE REJECT] "${ev.title}" — past metadata date ${ev.event_date}`);
+      await rejectPlaceholder(`Event date is in the past (${ev.event_date}).`);
       return false;
     }
   }
 
-  // STAGE 3: AI classification (CLASSIFICATION ONLY — no enforcement here)
+  // STAGE 3: AI classification
   if (!lovableApiKey) {
     stats.filtered_ai++;
     console.log(`[AI SKIP-REJECT] "${ev.title}" — no AI key`);
+    await rejectPlaceholder('AI classifier unavailable.');
     return false;
   }
 
@@ -1171,15 +1172,17 @@ async function processEvent(
   if (!aiResult) {
     stats.filtered_ai++;
     console.log(`[AI REJECT] "${ev.title}" — classifier failed`);
+    await rejectPlaceholder('AI classifier failed to return a verdict.');
     return false;
   }
 
-  // STAGE 4: FINAL VALIDATOR (single source of truth)
+  // STAGE 4: FINAL VALIDATOR
   const verdict = finalValidate(ev, aiResult);
   if (!verdict.ok) {
     stats.filtered_ai++;
     const tag = ev.source_type === "discovery" ? "AI REJECT DISCOVERY" : "FINAL REJECT";
     console.log(`[${tag}] "${ev.title}" — ${verdict.reason} | AI conf=${aiResult.confidence}`);
+    await rejectPlaceholder(`AI rejected: ${verdict.reason} (confidence ${aiResult.confidence}).`);
     return false;
   }
   const acceptTag = ev.source_type === "discovery" ? "AI ACCEPT DISCOVERY" : "ACCEPT";
