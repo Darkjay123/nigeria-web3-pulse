@@ -1199,17 +1199,19 @@ async function processEvent(
   const confidenceScore = aiResult.confidence;
   const dedupHash = await generateDedupHash(ev.title, eventDate, resolvedState);
 
-  // STAGE 5: Dedup
-  const isDupe = await isDuplicateEvent(ev.title, eventDate, ev.registration_link, ev.source_url, dedupHash, supabase);
-  if (isDupe) {
-    stats.duplicates++;
-    return false;
+  // STAGE 5: Dedup (skip when upgrading a placeholder — placeholder IS the row)
+  if (!upgradeId) {
+    const isDupe = await isDuplicateEvent(ev.title, eventDate, ev.registration_link, ev.source_url, dedupHash, supabase);
+    if (isDupe) {
+      stats.duplicates++;
+      return false;
+    }
   }
 
   const submissionCount = ev._submission_count || 0;
   const popularityScore = (submissionCount * 0.4) + (confidenceScore * 0.6);
 
-  const { error } = await supabase.from('events').insert({
+  const payload = {
     title: ev.title.substring(0, 500),
     description: ev.description?.substring(0, 2000) || null,
     city,
@@ -1227,22 +1229,24 @@ async function processEvent(
     is_online: isOnline,
     confidence_score: confidenceScore,
     dedup_hash: dedupHash,
-    status: 'upcoming',
+    status: 'upcoming' as const,
     source_platform: ev.source_platform || sourceName,
-    image_url: null,
     submission_count: submissionCount,
     popularity_score: popularityScore,
-    posted_to_telegram: false,
-  });
+  };
+
+  const { error } = upgradeId
+    ? await supabase.from('events').update(payload).eq('id', upgradeId)
+    : await supabase.from('events').insert({ ...payload, image_url: null, posted_to_telegram: false });
 
   if (error) {
-    console.error('Insert error:', error.message);
-    stats.errors += `Insert: ${error.message}; `;
+    console.error('Persist error:', error.message);
+    stats.errors += `Persist: ${error.message}; `;
     return false;
   }
 
   stats.inserted++;
-  console.log(`INSERTED: "${ev.title}" [${eventType}] confidence=${confidenceScore}`);
+  console.log(`${upgradeId ? 'UPGRADED' : 'INSERTED'}: "${ev.title}" [${eventType}] confidence=${confidenceScore}`);
   return true;
 }
 
