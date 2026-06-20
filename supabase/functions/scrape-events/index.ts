@@ -1110,6 +1110,12 @@ function finalValidate(ev: NormalizedEvent, ai: AIClassification): { ok: boolean
   return { ok: true, reason: "ok (structured)" };
 }
 
+// v10 — per-gate rejection counters for telemetry
+function bumpGate(stats: any, gate: string) {
+  if (!stats.gate_rejections) stats.gate_rejections = {};
+  stats.gate_rejections[gate] = (stats.gate_rejections[gate] || 0) + 1;
+}
+
 async function processEvent(
   raw: any,
   sourceName: string,
