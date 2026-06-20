@@ -1070,37 +1070,42 @@ async function scrapeMeetupEvents(): Promise<any[]> {
  * Combines AI classification (signals only) + normalized event facts.
  * AI is now classification-only; structural rules live HERE.
  */
-function finalValidate(ev: NormalizedEvent, ai: AIClassification): { ok: boolean; reason: string } {
-  if (!ai.is_event) return { ok: false, reason: `AI: not an event (${ai.reason})` };
-  if (ai.is_listicle) return { ok: false, reason: `AI: listicle (${ai.reason})` };
+function finalValidate(ev: NormalizedEvent, ai: AIClassification): { ok: boolean; reason: string; gate?: string } {
+  if (!ai.is_event) return { ok: false, reason: `AI: not an event (${ai.reason})`, gate: 'ai_not_event' };
+  if (ai.is_listicle) return { ok: false, reason: `AI: listicle (${ai.reason})`, gate: 'ai_listicle' };
 
-  // AI reason anti-drift guard — reject hedged or past-event language.
   if (ai.reason && AI_UNCERTAIN_RE.test(ai.reason)) {
-    return { ok: false, reason: `AI: hedged/past-event language ("${ai.reason}")` };
+    return { ok: false, reason: `AI: hedged/past-event language ("${ai.reason}")`, gate: 'ai_uncertain' };
   }
 
   const eventDate = ai.event_date || ev.event_date;
 
-  // Future-event validation — only when a real date was resolvable.
   if (isPastDate(eventDate)) {
-    return { ok: false, reason: `past event (date=${eventDate})` };
+    return { ok: false, reason: `past event (date=${eventDate})`, gate: 'past_date' };
   }
 
+  // v10 — Source-weighted confidence thresholds.
+  // Structured event-page sources (lu.ma JSON-LD, eventbrite, meetup) are higher signal
+  // by construction — lowering threshold from 0.85 → 0.75 unblocks the lu.ma drought.
+  // Tweets stay strict at 0.85.
+  const HIGH_TRUST = new Set(['luma', 'eventbrite', 'meetup', 'partiful']);
+  const minConf = HIGH_TRUST.has(ev.source_platform) ? 0.75 : 0.85;
+
   if (ev.source_type === "discovery") {
-    if (ai.confidence < 0.85) return { ok: false, reason: `AI discovery: low confidence ${ai.confidence}` };
+    if (ai.confidence < minConf) return { ok: false, reason: `AI discovery: low confidence ${ai.confidence} (need ${minConf})`, gate: 'ai_low_confidence' };
     return { ok: true, reason: "ok (discovery)" };
   }
 
-  // STRUCTURED — strict
-  if (ai.confidence < 0.85) return { ok: false, reason: `AI: low confidence ${ai.confidence}` };
-  if (!eventDate) return { ok: false, reason: "no resolvable date (text+metadata+AI all empty)" };
+  // STRUCTURED
+  if (ai.confidence < minConf) return { ok: false, reason: `AI: low confidence ${ai.confidence} (need ${minConf})`, gate: 'ai_low_confidence' };
+  if (!eventDate) return { ok: false, reason: "no resolvable date (text+metadata+AI all empty)", gate: 'no_date' };
 
   const isOnline = ai.is_online || ev.is_online;
   const hasLocation = !!ev.venue || !!ev.city || !!ai.city || !!ai.state || isOnline;
-  if (!hasLocation) return { ok: false, reason: "no location (no venue/city/online)" };
+  if (!hasLocation) return { ok: false, reason: "no location (no venue/city/online)", gate: 'no_location' };
 
   const hasRegistration = !!ev.registration_link || !!ev.source_url || ai.has_registration;
-  if (!hasRegistration) return { ok: false, reason: "no registration link" };
+  if (!hasRegistration) return { ok: false, reason: "no registration link", gate: 'no_registration' };
 
   return { ok: true, reason: "ok (structured)" };
 }
