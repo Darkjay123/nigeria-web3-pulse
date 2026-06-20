@@ -1,21 +1,18 @@
 ---
-name: Automation pipeline v9 — Discovery hardening + Luma via Firecrawl
-description: v9 adds intent gate, signal scoring, future-date validation, AI anti-drift; replaces dead Luma API with Firecrawl search
+name: Automation pipeline v10 — Gate telemetry, source-weighted confidence, title hygiene
+description: v10 adds per-gate rejection counters, lowers confidence to 0.75 for trusted structured sources (luma/eventbrite/meetup/partiful), cleans tweet-cruft titles, rejects fragment titles
 type: feature
 ---
-## Pipeline (v9)
+## Pipeline (v10)
 ```
-Scrape → Normalize → Page Type Gate → Web3 Keyword → [DISCOVERY: Intent + Score≥2 + past-meta-date] → AI → Final Validator (past-date, anti-drift, conf≥0.85) → Dedup → Insert
+Scrape → Normalize → cleanDisplayTitle → isLowQualityTitle gate → Page Type Gate → Web3 Keyword → [DISCOVERY: Intent + Score≥2 + past-meta-date] → AI → Final Validator (source-weighted conf: 0.75 trusted / 0.85 discovery, past-date, anti-drift) → Dedup → Insert
 ```
 
-## v9 Changes
-- **Discovery intent gate** — `EVENT_INTENT_PATTERNS` (join us, rsvp, hosting, spaces, ama, workshop, hackathon, save the date, etc.). No intent → reject pre-AI.
-- **Discovery signal score** — web3 + time + intent + platform; require ≥2.
-- **Future-date validation** — `isPastDate()` checks AI-resolved or metadata date in `finalValidate`. Pre-AI short-circuit only on metadata dates (text regex too noisy in tweets).
-- **AI anti-drift guard** — rejects reasons matching `/maybe|unclear|recap|past event|already happened|retrospective|history|throwback/`.
-- **Confidence kept at 0.85** for both modes (proposal's 0.80 would loosen — rejected).
-- **Luma fix** — `api.lu.ma/public/v2/event/search` is dead (404). Replaced with Firecrawl `/search` over `site:lu.ma <query>`, then `enrichLink` per real event page. Successfully discovered 15 lu.ma event pages in test.
-- **Logging tags**: `[DISCOVERY PASS]`, `[DISCOVERY REJECT]`, `[AI ACCEPT DISCOVERY]`, `[AI REJECT DISCOVERY]`, `[ACCEPT]`, `[FINAL REJECT]`, `[GATE REJECT]`.
+## v10 Changes
+- **Per-gate telemetry** — `scrape_logs.gate_rejections jsonb` records `{gate_name: count}`. `bumpGate(stats, name)` at every rejection. Gates: `title_too_short`, `low_quality_title`, `page_type:*`, `web3_keyword`, `discovery_no_intent`, `discovery_low_score`, `past_metadata_date`, `ai_unavailable`, `ai_failed`, `ai_not_event`, `ai_listicle`, `ai_uncertain`, `past_date`, `ai_low_confidence`, `no_date`, `no_location`, `no_registration`.
+- **Source-weighted confidence** — `HIGH_TRUST = {luma, eventbrite, meetup, partiful}` → threshold 0.75. Others (x, x_discovery, community) → 0.85. Unblocks lu.ma drought (429 found / 0 inserted over 30d).
+- **Title hygiene** — `cleanDisplayTitle()` strips `/ Posts / X`, `- Twitter`, `(@handle)`, caps at 140 chars. `isLowQualityTitle()` rejects question fragments <60 chars, mid-sentence ellipsis without event noun, profile-page titles.
+- **finalValidate returns `gate`** for telemetry tagging.
 
 ## Untouched
-Structured strictness · Dedup logic · AI schema · 0.85 threshold · X dual-output discovery.
+v9 intent/signal gates · Dedup logic · Firecrawl scraping · X dual-output · placeholder upgrade flow · 0.85 discovery threshold.
