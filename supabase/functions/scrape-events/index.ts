@@ -1427,14 +1427,15 @@ Deno.serve(async () => {
       }
     }
 
-    // Log scrape results
-    for (const [source, stats] of Object.entries(results)) {
+    // Log scrape results (with per-gate rejection breakdown)
+    for (const [source, stats] of Object.entries(results) as [string, any][]) {
       await supabase.from('scrape_logs').insert({
         source,
         events_found: stats.found,
         events_inserted: stats.inserted,
         duplicates_skipped: stats.duplicates,
         errors: stats.errors || null,
+        gate_rejections: stats.gate_rejections || {},
       });
     }
 
