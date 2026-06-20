@@ -596,6 +596,32 @@ function normalizeTitle(title: string): string {
     .trim();
 }
 
+// ============ DISPLAY TITLE CLEANER (v10) ============
+// Strips X/Twitter cruft, handles, page-meta suffixes, and rejects fragments
+// that obviously aren't event titles.
+const TITLE_CRUFT_RE = /\s*[-|/·•]\s*(?:Posts?|Twitter|X|Status|Tweet)(?:\s*\/\s*(?:X|Twitter))?\s*$/i;
+const HANDLE_RE = /\(@[A-Za-z0-9_]+\)/g;
+
+function cleanDisplayTitle(raw: string): string {
+  let t = (raw || '').trim();
+  for (let i = 0; i < 3; i++) {
+    const next = t.replace(TITLE_CRUFT_RE, '').trim();
+    if (next === t) break;
+    t = next;
+  }
+  t = t.replace(HANDLE_RE, '').replace(/\s{2,}/g, ' ').trim();
+  if (t.length > 140) t = t.slice(0, 137).trimEnd() + '…';
+  return t;
+}
+
+function isLowQualityTitle(t: string): boolean {
+  if (!t || t.length < 8) return true;
+  if (/^(?:are|is|do|does|did|why|what|how)\s+.*\?/i.test(t) && t.length < 60) return true;
+  if (/(\.\.\.|…)$/.test(t) && !/\b(meetup|hackathon|summit|workshop|conference|ama|space|webinar|bootcamp|event|hosting|join)\b/i.test(t)) return true;
+  if (/^@?[A-Za-z0-9_]+\s*\(@[A-Za-z0-9_]+\)\s*$/.test(t)) return true;
+  return false;
+}
+
 function normalizeUrl(url: string | null | undefined): string | null {
   if (!url) return null;
   try {
@@ -1044,39 +1070,50 @@ async function scrapeMeetupEvents(): Promise<any[]> {
  * Combines AI classification (signals only) + normalized event facts.
  * AI is now classification-only; structural rules live HERE.
  */
-function finalValidate(ev: NormalizedEvent, ai: AIClassification): { ok: boolean; reason: string } {
-  if (!ai.is_event) return { ok: false, reason: `AI: not an event (${ai.reason})` };
-  if (ai.is_listicle) return { ok: false, reason: `AI: listicle (${ai.reason})` };
+function finalValidate(ev: NormalizedEvent, ai: AIClassification): { ok: boolean; reason: string; gate?: string } {
+  if (!ai.is_event) return { ok: false, reason: `AI: not an event (${ai.reason})`, gate: 'ai_not_event' };
+  if (ai.is_listicle) return { ok: false, reason: `AI: listicle (${ai.reason})`, gate: 'ai_listicle' };
 
-  // AI reason anti-drift guard — reject hedged or past-event language.
   if (ai.reason && AI_UNCERTAIN_RE.test(ai.reason)) {
-    return { ok: false, reason: `AI: hedged/past-event language ("${ai.reason}")` };
+    return { ok: false, reason: `AI: hedged/past-event language ("${ai.reason}")`, gate: 'ai_uncertain' };
   }
 
   const eventDate = ai.event_date || ev.event_date;
 
-  // Future-event validation — only when a real date was resolvable.
   if (isPastDate(eventDate)) {
-    return { ok: false, reason: `past event (date=${eventDate})` };
+    return { ok: false, reason: `past event (date=${eventDate})`, gate: 'past_date' };
   }
 
+  // v10 — Source-weighted confidence thresholds.
+  // Structured event-page sources (lu.ma JSON-LD, eventbrite, meetup) are higher signal
+  // by construction — lowering threshold from 0.85 → 0.75 unblocks the lu.ma drought.
+  // Tweets stay strict at 0.85.
+  const HIGH_TRUST = new Set(['luma', 'eventbrite', 'meetup', 'partiful']);
+  const minConf = HIGH_TRUST.has(ev.source_platform) ? 0.75 : 0.85;
+
   if (ev.source_type === "discovery") {
-    if (ai.confidence < 0.85) return { ok: false, reason: `AI discovery: low confidence ${ai.confidence}` };
+    if (ai.confidence < minConf) return { ok: false, reason: `AI discovery: low confidence ${ai.confidence} (need ${minConf})`, gate: 'ai_low_confidence' };
     return { ok: true, reason: "ok (discovery)" };
   }
 
-  // STRUCTURED — strict
-  if (ai.confidence < 0.85) return { ok: false, reason: `AI: low confidence ${ai.confidence}` };
-  if (!eventDate) return { ok: false, reason: "no resolvable date (text+metadata+AI all empty)" };
+  // STRUCTURED
+  if (ai.confidence < minConf) return { ok: false, reason: `AI: low confidence ${ai.confidence} (need ${minConf})`, gate: 'ai_low_confidence' };
+  if (!eventDate) return { ok: false, reason: "no resolvable date (text+metadata+AI all empty)", gate: 'no_date' };
 
   const isOnline = ai.is_online || ev.is_online;
   const hasLocation = !!ev.venue || !!ev.city || !!ai.city || !!ai.state || isOnline;
-  if (!hasLocation) return { ok: false, reason: "no location (no venue/city/online)" };
+  if (!hasLocation) return { ok: false, reason: "no location (no venue/city/online)", gate: 'no_location' };
 
   const hasRegistration = !!ev.registration_link || !!ev.source_url || ai.has_registration;
-  if (!hasRegistration) return { ok: false, reason: "no registration link" };
+  if (!hasRegistration) return { ok: false, reason: "no registration link", gate: 'no_registration' };
 
   return { ok: true, reason: "ok (structured)" };
+}
+
+// v10 — per-gate rejection counters for telemetry
+function bumpGate(stats: any, gate: string) {
+  if (!stats.gate_rejections) stats.gate_rejections = {};
+  stats.gate_rejections[gate] = (stats.gate_rejections[gate] || 0) + 1;
 }
 
 async function processEvent(
@@ -1098,8 +1135,21 @@ async function processEvent(
 
   // STAGE 0: NORMALIZE — uniform shape, metadata-aware date extraction
   const ev = normalizeEvent(raw);
+
+  // v10: clean display title BEFORE any gate so logs read clean and downstream uses cleaned text
+  ev.title = cleanDisplayTitle(ev.title);
+
   if (!ev.title || ev.title.length < 5) {
+    bumpGate(stats, 'title_too_short');
     await rejectPlaceholder('Title missing or too short after enrichment.');
+    return false;
+  }
+
+  // v10: reject obvious tweet-fragment / profile-page titles
+  if (isLowQualityTitle(ev.title)) {
+    bumpGate(stats, 'low_quality_title');
+    console.log(`[TITLE REJECT] "${ev.title}" — looks like a tweet fragment / profile page`);
+    await rejectPlaceholder(`Title doesn't look like an event title: "${ev.title}"`);
     return false;
   }
 
@@ -1109,6 +1159,7 @@ async function processEvent(
   const gate = pageTypeGate(ev);
   if (!gate.pass) {
     stats.filtered_gate++;
+    bumpGate(stats, `page_type:${gate.reason.split(':')[0].slice(0, 40)}`);
     console.log(`[GATE REJECT] "${ev.title}" — ${gate.reason}`);
     await rejectPlaceholder(`Rejected by page-type gate: ${gate.reason}`);
     return false;
@@ -1119,6 +1170,7 @@ async function processEvent(
   const kwThreshold = ev.source_type === "discovery" ? 1 : 2;
   if (kwScore < kwThreshold) {
     stats.filtered_keyword++;
+    bumpGate(stats, 'web3_keyword');
     console.log(`[KEYWORD REJECT] "${ev.title}" (score=${kwScore}, need=${kwThreshold}, mode=${ev.source_type})`);
     await rejectPlaceholder(`Not enough Web3 signal in content (score ${kwScore}/${kwThreshold}).`);
     return false;
@@ -1129,18 +1181,21 @@ async function processEvent(
     const sig = discoverySignalScore(ev, fullText);
     if (!sig.intent) {
       stats.filtered_keyword++;
+      bumpGate(stats, 'discovery_no_intent');
       console.log(`[DISCOVERY REJECT] "${ev.title}" — no intent signal (score=${sig.score}, web3=${sig.web3} time=${sig.time} platform=${sig.platform})`);
       await rejectPlaceholder('No event intent signal found.');
       return false;
     }
     if (sig.score < 2) {
       stats.filtered_keyword++;
+      bumpGate(stats, 'discovery_low_score');
       console.log(`[DISCOVERY REJECT] "${ev.title}" — low score=${sig.score} (need ≥2)`);
       await rejectPlaceholder(`Discovery signal too low (${sig.score}/2).`);
       return false;
     }
     if (ev.has_metadata_date && isPastDate(ev.event_date)) {
       stats.filtered_gate++;
+      bumpGate(stats, 'past_metadata_date');
       console.log(`[DISCOVERY REJECT] "${ev.title}" — past metadata date ${ev.event_date}`);
       await rejectPlaceholder(`Event date is in the past (${ev.event_date}).`);
       return false;
@@ -1149,6 +1204,7 @@ async function processEvent(
   } else {
     if (ev.has_metadata_date && isPastDate(ev.event_date)) {
       stats.filtered_gate++;
+      bumpGate(stats, 'past_metadata_date');
       console.log(`[GATE REJECT] "${ev.title}" — past metadata date ${ev.event_date}`);
       await rejectPlaceholder(`Event date is in the past (${ev.event_date}).`);
       return false;
@@ -1158,6 +1214,7 @@ async function processEvent(
   // STAGE 3: AI classification
   if (!lovableApiKey) {
     stats.filtered_ai++;
+    bumpGate(stats, 'ai_unavailable');
     console.log(`[AI SKIP-REJECT] "${ev.title}" — no AI key`);
     await rejectPlaceholder('AI classifier unavailable.');
     return false;
@@ -1171,6 +1228,7 @@ async function processEvent(
 
   if (!aiResult) {
     stats.filtered_ai++;
+    bumpGate(stats, 'ai_failed');
     console.log(`[AI REJECT] "${ev.title}" — classifier failed`);
     await rejectPlaceholder('AI classifier failed to return a verdict.');
     return false;
@@ -1180,6 +1238,7 @@ async function processEvent(
   const verdict = finalValidate(ev, aiResult);
   if (!verdict.ok) {
     stats.filtered_ai++;
+    bumpGate(stats, verdict.gate || 'final_validate');
     const tag = ev.source_type === "discovery" ? "AI REJECT DISCOVERY" : "FINAL REJECT";
     console.log(`[${tag}] "${ev.title}" — ${verdict.reason} | AI conf=${aiResult.confidence}`);
     await rejectPlaceholder(`AI rejected: ${verdict.reason} (confidence ${aiResult.confidence}).`);
@@ -1368,14 +1427,15 @@ Deno.serve(async () => {
       }
     }
 
-    // Log scrape results
-    for (const [source, stats] of Object.entries(results)) {
+    // Log scrape results (with per-gate rejection breakdown)
+    for (const [source, stats] of Object.entries(results) as [string, any][]) {
       await supabase.from('scrape_logs').insert({
         source,
         events_found: stats.found,
         events_inserted: stats.inserted,
         duplicates_skipped: stats.duplicates,
         errors: stats.errors || null,
+        gate_rejections: stats.gate_rejections || {},
       });
     }
 

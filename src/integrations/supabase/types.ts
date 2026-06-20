@@ -111,6 +111,7 @@ export type Database = {
           errors: string | null
           events_found: number
           events_inserted: number
+          gate_rejections: Json
           id: string
           source: string
         }
@@ -120,6 +121,7 @@ export type Database = {
           errors?: string | null
           events_found?: number
           events_inserted?: number
+          gate_rejections?: Json
           id?: string
           source: string
         }
@@ -129,6 +131,7 @@ export type Database = {
           errors?: string | null
           events_found?: number
           events_inserted?: number
+          gate_rejections?: Json
           id?: string
           source?: string
         }
