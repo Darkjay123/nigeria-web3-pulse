@@ -1170,6 +1170,7 @@ async function processEvent(
   const kwThreshold = ev.source_type === "discovery" ? 1 : 2;
   if (kwScore < kwThreshold) {
     stats.filtered_keyword++;
+    bumpGate(stats, 'web3_keyword');
     console.log(`[KEYWORD REJECT] "${ev.title}" (score=${kwScore}, need=${kwThreshold}, mode=${ev.source_type})`);
     await rejectPlaceholder(`Not enough Web3 signal in content (score ${kwScore}/${kwThreshold}).`);
     return false;
@@ -1180,18 +1181,21 @@ async function processEvent(
     const sig = discoverySignalScore(ev, fullText);
     if (!sig.intent) {
       stats.filtered_keyword++;
+      bumpGate(stats, 'discovery_no_intent');
       console.log(`[DISCOVERY REJECT] "${ev.title}" — no intent signal (score=${sig.score}, web3=${sig.web3} time=${sig.time} platform=${sig.platform})`);
       await rejectPlaceholder('No event intent signal found.');
       return false;
     }
     if (sig.score < 2) {
       stats.filtered_keyword++;
+      bumpGate(stats, 'discovery_low_score');
       console.log(`[DISCOVERY REJECT] "${ev.title}" — low score=${sig.score} (need ≥2)`);
       await rejectPlaceholder(`Discovery signal too low (${sig.score}/2).`);
       return false;
     }
     if (ev.has_metadata_date && isPastDate(ev.event_date)) {
       stats.filtered_gate++;
+      bumpGate(stats, 'past_metadata_date');
       console.log(`[DISCOVERY REJECT] "${ev.title}" — past metadata date ${ev.event_date}`);
       await rejectPlaceholder(`Event date is in the past (${ev.event_date}).`);
       return false;
@@ -1200,6 +1204,7 @@ async function processEvent(
   } else {
     if (ev.has_metadata_date && isPastDate(ev.event_date)) {
       stats.filtered_gate++;
+      bumpGate(stats, 'past_metadata_date');
       console.log(`[GATE REJECT] "${ev.title}" — past metadata date ${ev.event_date}`);
       await rejectPlaceholder(`Event date is in the past (${ev.event_date}).`);
       return false;
@@ -1209,6 +1214,7 @@ async function processEvent(
   // STAGE 3: AI classification
   if (!lovableApiKey) {
     stats.filtered_ai++;
+    bumpGate(stats, 'ai_unavailable');
     console.log(`[AI SKIP-REJECT] "${ev.title}" — no AI key`);
     await rejectPlaceholder('AI classifier unavailable.');
     return false;
@@ -1222,6 +1228,7 @@ async function processEvent(
 
   if (!aiResult) {
     stats.filtered_ai++;
+    bumpGate(stats, 'ai_failed');
     console.log(`[AI REJECT] "${ev.title}" — classifier failed`);
     await rejectPlaceholder('AI classifier failed to return a verdict.');
     return false;
@@ -1231,6 +1238,7 @@ async function processEvent(
   const verdict = finalValidate(ev, aiResult);
   if (!verdict.ok) {
     stats.filtered_ai++;
+    bumpGate(stats, verdict.gate || 'final_validate');
     const tag = ev.source_type === "discovery" ? "AI REJECT DISCOVERY" : "FINAL REJECT";
     console.log(`[${tag}] "${ev.title}" — ${verdict.reason} | AI conf=${aiResult.confidence}`);
     await rejectPlaceholder(`AI rejected: ${verdict.reason} (confidence ${aiResult.confidence}).`);
