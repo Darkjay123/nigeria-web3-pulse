@@ -1129,8 +1129,21 @@ async function processEvent(
 
   // STAGE 0: NORMALIZE — uniform shape, metadata-aware date extraction
   const ev = normalizeEvent(raw);
+
+  // v10: clean display title BEFORE any gate so logs read clean and downstream uses cleaned text
+  ev.title = cleanDisplayTitle(ev.title);
+
   if (!ev.title || ev.title.length < 5) {
+    bumpGate(stats, 'title_too_short');
     await rejectPlaceholder('Title missing or too short after enrichment.');
+    return false;
+  }
+
+  // v10: reject obvious tweet-fragment / profile-page titles
+  if (isLowQualityTitle(ev.title)) {
+    bumpGate(stats, 'low_quality_title');
+    console.log(`[TITLE REJECT] "${ev.title}" — looks like a tweet fragment / profile page`);
+    await rejectPlaceholder(`Title doesn't look like an event title: "${ev.title}"`);
     return false;
   }
 
@@ -1140,6 +1153,7 @@ async function processEvent(
   const gate = pageTypeGate(ev);
   if (!gate.pass) {
     stats.filtered_gate++;
+    bumpGate(stats, `page_type:${gate.reason.split(':')[0].slice(0, 40)}`);
     console.log(`[GATE REJECT] "${ev.title}" — ${gate.reason}`);
     await rejectPlaceholder(`Rejected by page-type gate: ${gate.reason}`);
     return false;
