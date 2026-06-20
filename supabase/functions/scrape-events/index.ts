@@ -596,6 +596,32 @@ function normalizeTitle(title: string): string {
     .trim();
 }
 
+// ============ DISPLAY TITLE CLEANER (v10) ============
+// Strips X/Twitter cruft, handles, page-meta suffixes, and rejects fragments
+// that obviously aren't event titles.
+const TITLE_CRUFT_RE = /\s*[-|/·•]\s*(?:Posts?|Twitter|X|Status|Tweet)(?:\s*\/\s*(?:X|Twitter))?\s*$/i;
+const HANDLE_RE = /\(@[A-Za-z0-9_]+\)/g;
+
+function cleanDisplayTitle(raw: string): string {
+  let t = (raw || '').trim();
+  for (let i = 0; i < 3; i++) {
+    const next = t.replace(TITLE_CRUFT_RE, '').trim();
+    if (next === t) break;
+    t = next;
+  }
+  t = t.replace(HANDLE_RE, '').replace(/\s{2,}/g, ' ').trim();
+  if (t.length > 140) t = t.slice(0, 137).trimEnd() + '…';
+  return t;
+}
+
+function isLowQualityTitle(t: string): boolean {
+  if (!t || t.length < 8) return true;
+  if (/^(?:are|is|do|does|did|why|what|how)\s+.*\?/i.test(t) && t.length < 60) return true;
+  if (/(\.\.\.|…)$/.test(t) && !/\b(meetup|hackathon|summit|workshop|conference|ama|space|webinar|bootcamp|event|hosting|join)\b/i.test(t)) return true;
+  if (/^@?[A-Za-z0-9_]+\s*\(@[A-Za-z0-9_]+\)\s*$/.test(t)) return true;
+  return false;
+}
+
 function normalizeUrl(url: string | null | undefined): string | null {
   if (!url) return null;
   try {
