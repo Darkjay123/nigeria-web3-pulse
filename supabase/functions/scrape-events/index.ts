@@ -1634,6 +1634,26 @@ Deno.serve(async () => {
       }
     }
 
+    // ---- Phase 1c: Nitter fallback (when X via Firecrawl returns nothing) ----
+    let nitterEvents: any[] = [];
+    if (xTweetEvents.length === 0) {
+      try {
+        const nitterQueries = [
+          'web3 lagos OR nigeria',
+          'blockchain meetup nigeria',
+          'crypto AMA africa',
+          '"twitter space" web3 nigeria',
+          '"join us" web3 lagos',
+        ];
+        nitterEvents = await scrapeNitter(nitterQueries);
+        results.nitter.found = nitterEvents.length;
+        console.log(`[Nitter] fallback found ${nitterEvents.length} candidates`);
+      } catch (e) {
+        results.nitter.errors = String(e);
+        console.error('[Nitter] failed:', e);
+      }
+    }
+
     // ---- Phase 2: Process all events through pipeline ----
     const allRaw = [
       ...enrichedLuma.map(e => ({ ...e, _source: 'luma' as const })),
@@ -1641,6 +1661,7 @@ Deno.serve(async () => {
       ...meetupEvents.map(e => ({ ...e, _source: 'meetup' as const })),
       ...xDiscoveredEvents.map(e => ({ ...e, _source: 'x_discovery' as const })),
       ...xTweetEvents.map(e => ({ ...e, _source: 'x' as const })),
+      ...nitterEvents.map(e => ({ ...e, _source: 'nitter' as const })),
     ];
 
     console.log(`Total raw candidates: ${allRaw.length} (max 50 will be processed)`);
