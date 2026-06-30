@@ -104,6 +104,57 @@ export type Database = {
         }
         Relationships: []
       }
+      pipeline_alerts: {
+        Row: {
+          last_alert_at: string
+          payload: Json
+          reason: string | null
+          source: string
+        }
+        Insert: {
+          last_alert_at?: string
+          payload?: Json
+          reason?: string | null
+          source: string
+        }
+        Update: {
+          last_alert_at?: string
+          payload?: Json
+          reason?: string | null
+          source?: string
+        }
+        Relationships: []
+      }
+      pipeline_config: {
+        Row: {
+          ai_confidence_threshold: number
+          last_tuned_at: string | null
+          max_threshold: number
+          min_threshold: number
+          notes: string | null
+          source: string
+          updated_at: string
+        }
+        Insert: {
+          ai_confidence_threshold?: number
+          last_tuned_at?: string | null
+          max_threshold?: number
+          min_threshold?: number
+          notes?: string | null
+          source: string
+          updated_at?: string
+        }
+        Update: {
+          ai_confidence_threshold?: number
+          last_tuned_at?: string | null
+          max_threshold?: number
+          min_threshold?: number
+          notes?: string | null
+          source?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
       scrape_logs: {
         Row: {
           created_at: string
