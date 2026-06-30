@@ -1084,12 +1084,11 @@ function finalValidate(ev: NormalizedEvent, ai: AIClassification): { ok: boolean
     return { ok: false, reason: `past event (date=${eventDate})`, gate: 'past_date' };
   }
 
-  // v10 — Source-weighted confidence thresholds.
-  // Structured event-page sources (lu.ma JSON-LD, eventbrite, meetup) are higher signal
-  // by construction — lowering threshold from 0.85 → 0.75 unblocks the lu.ma drought.
-  // Tweets stay strict at 0.85.
+  // v11 — Per-source confidence threshold, auto-tuned and read from pipeline_config.
+  // Falls back to the v10 source-weighted defaults if config wasn't loaded.
   const HIGH_TRUST = new Set(['luma', 'eventbrite', 'meetup', 'partiful']);
-  const minConf = HIGH_TRUST.has(ev.source_platform) ? 0.75 : 0.85;
+  const fallback = HIGH_TRUST.has(ev.source_platform) ? 0.75 : 0.85;
+  const minConf = THRESHOLDS[ev.source_platform] ?? fallback;
 
   if (ev.source_type === "discovery") {
     if (ai.confidence < minConf) return { ok: false, reason: `AI discovery: low confidence ${ai.confidence} (need ${minConf})`, gate: 'ai_low_confidence' };
