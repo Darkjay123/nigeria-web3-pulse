@@ -1084,12 +1084,11 @@ function finalValidate(ev: NormalizedEvent, ai: AIClassification): { ok: boolean
     return { ok: false, reason: `past event (date=${eventDate})`, gate: 'past_date' };
   }
 
-  // v10 — Source-weighted confidence thresholds.
-  // Structured event-page sources (lu.ma JSON-LD, eventbrite, meetup) are higher signal
-  // by construction — lowering threshold from 0.85 → 0.75 unblocks the lu.ma drought.
-  // Tweets stay strict at 0.85.
+  // v11 — Per-source confidence threshold, auto-tuned and read from pipeline_config.
+  // Falls back to the v10 source-weighted defaults if config wasn't loaded.
   const HIGH_TRUST = new Set(['luma', 'eventbrite', 'meetup', 'partiful']);
-  const minConf = HIGH_TRUST.has(ev.source_platform) ? 0.75 : 0.85;
+  const fallback = HIGH_TRUST.has(ev.source_platform) ? 0.75 : 0.85;
+  const minConf = THRESHOLDS[ev.source_platform] ?? fallback;
 
   if (ev.source_type === "discovery") {
     if (ai.confidence < minConf) return { ok: false, reason: `AI discovery: low confidence ${ai.confidence} (need ${minConf})`, gate: 'ai_low_confidence' };
@@ -1115,6 +1114,238 @@ function bumpGate(stats: any, gate: string) {
   if (!stats.gate_rejections) stats.gate_rejections = {};
   stats.gate_rejections[gate] = (stats.gate_rejections[gate] || 0) + 1;
 }
+
+// ============ v11: Adaptive thresholds + yield alerts + Nitter ============
+
+// Module-level threshold cache. Populated from pipeline_config at the start
+// of each run; falls back to per-source defaults inside finalValidate.
+const THRESHOLDS: Record<string, number> = {};
+const THRESHOLD_META: Record<string, { min: number; max: number }> = {};
+
+async function loadThresholds(supabase: any): Promise<void> {
+  try {
+    const { data, error } = await supabase
+      .from('pipeline_config')
+      .select('source, ai_confidence_threshold, min_threshold, max_threshold');
+    if (error || !data) return;
+    for (const row of data) {
+      THRESHOLDS[row.source] = Number(row.ai_confidence_threshold);
+      THRESHOLD_META[row.source] = {
+        min: Number(row.min_threshold),
+        max: Number(row.max_threshold),
+      };
+    }
+    console.log(`[v11 config] loaded thresholds: ${JSON.stringify(THRESHOLDS)}`);
+  } catch (e) {
+    console.error('[v11 config] failed to load thresholds:', e);
+  }
+}
+
+// Auto-tune: nudge a source's threshold DOWN by 0.02 when its top reason for
+// rejection over the last 7d is `ai_low_confidence` and it inserted 0 events;
+// nudge UP by 0.02 when the source is over-accepting (>=5 inserts AND no
+// recent quality complaints — proxied by zero `community_flag` rejections).
+// Bounded by per-source min/max from pipeline_config.
+async function autoTuneThresholds(supabase: any): Promise<void> {
+  try {
+    const since = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+    const { data: logs } = await supabase
+      .from('scrape_logs')
+      .select('source, events_inserted, events_found, gate_rejections')
+      .gte('created_at', since);
+    if (!logs) return;
+
+    const agg: Record<string, { found: number; inserted: number; lowConf: number; otherRej: number }> = {};
+    for (const log of logs) {
+      const s = log.source;
+      if (!THRESHOLD_META[s]) continue;
+      agg[s] ??= { found: 0, inserted: 0, lowConf: 0, otherRej: 0 };
+      agg[s].found += log.events_found || 0;
+      agg[s].inserted += log.events_inserted || 0;
+      const gr = log.gate_rejections || {};
+      agg[s].lowConf += Number(gr.ai_low_confidence || 0);
+      for (const [k, v] of Object.entries(gr)) {
+        if (k !== 'ai_low_confidence') agg[s].otherRej += Number(v) || 0;
+      }
+    }
+
+    for (const [source, s] of Object.entries(agg)) {
+      const meta = THRESHOLD_META[source];
+      const current = THRESHOLDS[source];
+      let next = current;
+      let note = '';
+
+      // Loosen: real candidates exist but everything dies at low_confidence
+      if (s.found >= 5 && s.inserted === 0 && s.lowConf >= Math.max(2, Math.floor(s.found * 0.3))) {
+        next = Math.max(meta.min, +(current - 0.02).toFixed(2));
+        note = `loosen: found=${s.found} inserted=0 lowConf=${s.lowConf}`;
+      }
+      // Tighten: lots of inserts; raise the bar slowly to defend precision
+      else if (s.inserted >= 8 && current < meta.max) {
+        next = Math.min(meta.max, +(current + 0.02).toFixed(2));
+        note = `tighten: inserted=${s.inserted}`;
+      }
+
+      if (next !== current) {
+        await supabase
+          .from('pipeline_config')
+          .update({
+            ai_confidence_threshold: next,
+            last_tuned_at: new Date().toISOString(),
+            notes: note,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('source', source);
+        console.log(`[v11 auto-tune] ${source}: ${current} → ${next} (${note})`);
+      }
+    }
+  } catch (e) {
+    console.error('[v11 auto-tune] failed:', e);
+  }
+}
+
+// Yield alert: if a source found > 10 candidates in last 7d but inserted 0,
+// or returned 0 candidates across 20+ runs (likely scraper broken), post a
+// single Telegram alert. Rate-limited via pipeline_alerts (24h window).
+async function maybeSendYieldAlerts(supabase: any): Promise<void> {
+  try {
+    const since = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+    const { data: logs } = await supabase
+      .from('scrape_logs')
+      .select('source, events_found, events_inserted')
+      .gte('created_at', since);
+    if (!logs) return;
+
+    const agg: Record<string, { runs: number; found: number; inserted: number }> = {};
+    for (const log of logs) {
+      const s = log.source;
+      agg[s] ??= { runs: 0, found: 0, inserted: 0 };
+      agg[s].runs += 1;
+      agg[s].found += log.events_found || 0;
+      agg[s].inserted += log.events_inserted || 0;
+    }
+
+    const { data: alerts } = await supabase
+      .from('pipeline_alerts')
+      .select('source, last_alert_at');
+    const lastAlert: Record<string, string> = {};
+    for (const a of (alerts || [])) lastAlert[a.source] = a.last_alert_at;
+    const dayAgo = Date.now() - 24 * 3600 * 1000;
+
+    const issues: { source: string; reason: string }[] = [];
+    for (const [source, s] of Object.entries(agg)) {
+      let reason = '';
+      if (s.found >= 10 && s.inserted === 0) {
+        reason = `${s.found} candidates found in last 7d but ZERO inserted — pipeline likely over-filtering.`;
+      } else if (s.runs >= 20 && s.found === 0) {
+        reason = `${s.runs} runs in last 7d returned ZERO candidates — scraper likely broken or blocked.`;
+      }
+      if (!reason) continue;
+      const last = lastAlert[source];
+      if (last && new Date(last).getTime() > dayAgo) continue; // rate-limit
+      issues.push({ source, reason });
+    }
+
+    if (issues.length === 0) return;
+
+    const lines = ['🚨 <b>NextChain Pipeline Yield Alert</b>', ''];
+    for (const i of issues) lines.push(`• <b>${i.source}</b>: ${i.reason}`);
+    const text = lines.join('\n');
+
+    const channelId = Deno.env.get('TELEGRAM_CHANNEL_ID');
+    const lovableKey = Deno.env.get('LOVABLE_API_KEY');
+    const tgKey = Deno.env.get('TELEGRAM_API_KEY');
+    if (channelId && lovableKey && tgKey) {
+      const resp = await fetch('https://connector-gateway.lovable.dev/telegram/sendMessage', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${lovableKey}`,
+          'X-Connection-Api-Key': tgKey,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          chat_id: channelId,
+          text,
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+        }),
+      });
+      if (!resp.ok) console.error('[v11 yield-alert] telegram failed:', resp.status);
+    } else {
+      console.warn('[v11 yield-alert] telegram env missing — alert NOT sent:', text);
+    }
+
+    for (const i of issues) {
+      await supabase.from('pipeline_alerts').upsert({
+        source: i.source,
+        last_alert_at: new Date().toISOString(),
+        reason: i.reason,
+        payload: agg[i.source],
+      });
+    }
+  } catch (e) {
+    console.error('[v11 yield-alert] failed:', e);
+  }
+}
+
+// Nitter: free X mirror with RSS. Try a rotating set of instances; first one
+// that responds wins. Returns tweet-shaped candidates compatible with the
+// existing discovery pipeline.
+const NITTER_INSTANCES = [
+  'nitter.privacydev.net',
+  'nitter.poast.org',
+  'xcancel.com',
+  'nitter.net',
+];
+
+async function scrapeNitter(queries: string[]): Promise<any[]> {
+  const tweets: any[] = [];
+  for (const query of queries) {
+    let xml: string | null = null;
+    let used = '';
+    for (const inst of NITTER_INSTANCES) {
+      try {
+        const url = `https://${inst}/search/rss?f=tweets&q=${encodeURIComponent(query)}`;
+        const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+        if (r.ok) {
+          const body = await r.text();
+          if (body.includes('<item>') || body.includes('<item ')) {
+            xml = body; used = inst; break;
+          }
+        }
+      } catch { /* try next instance */ }
+    }
+    if (!xml) { console.warn(`[Nitter] all instances failed for "${query}"`); continue; }
+    console.log(`[Nitter] hit ${used} for "${query}"`);
+
+    // Minimal RSS parse — pull <item> blocks then extract title/link/description
+    const items = xml.match(/<item[\s\S]*?<\/item>/g) || [];
+    for (const item of items.slice(0, 6)) {
+      const grab = (tag: string) => {
+        const m = item.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`));
+        if (!m) return '';
+        return m[1].replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').trim();
+      };
+      const title = grab('title').replace(/<[^>]+>/g, '');
+      const link = grab('link');
+      const desc = grab('description').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      if (!title || title.length < 10 || !link) continue;
+      const xUrl = link.replace(/^https?:\/\/[^/]+/, 'https://x.com');
+      tweets.push({
+        title: title.substring(0, 240),
+        description: (desc || title).substring(0, 1500),
+        source_url: xUrl,
+        registration_link: xUrl,
+        source_platform: 'nitter',
+        venue: null, city: null, event_date: null, event_time: null, end_date: null, organizer: null,
+        is_online: /twitter\s+space|x\s+space|virtual|online|zoom/i.test(desc + ' ' + title),
+      });
+    }
+  }
+  return tweets;
+}
+
+
 
 async function processEvent(
   raw: any,
@@ -1319,6 +1550,9 @@ Deno.serve(async () => {
     const firecrawlApiKey = Deno.env.get('FIRECRAWL_API_KEY') || '';
     const supabase = createClient(supabaseUrl, supabaseKey);
 
+    // v11 — load auto-tuned thresholds before any AI gating runs
+    await loadThresholds(supabase);
+
     const emptyStats = () => ({ found: 0, inserted: 0, duplicates: 0, filtered_keyword: 0, filtered_ai: 0, filtered_gate: 0, errors: '' });
     const results: Record<string, any> = {
       luma: emptyStats(),
@@ -1326,6 +1560,7 @@ Deno.serve(async () => {
       meetup: emptyStats(),
       x: emptyStats(),                // tweet-native (discovery mode)
       x_discovery: emptyStats(),      // outbound links enriched (structured mode)
+      nitter: emptyStats(),           // v11 — Nitter fallback for X
     };
 
     // ---- Phase 1: Scrape structured platforms in parallel ----
@@ -1399,6 +1634,26 @@ Deno.serve(async () => {
       }
     }
 
+    // ---- Phase 1c: Nitter fallback (when X via Firecrawl returns nothing) ----
+    let nitterEvents: any[] = [];
+    if (xTweetEvents.length === 0) {
+      try {
+        const nitterQueries = [
+          'web3 lagos OR nigeria',
+          'blockchain meetup nigeria',
+          'crypto AMA africa',
+          '"twitter space" web3 nigeria',
+          '"join us" web3 lagos',
+        ];
+        nitterEvents = await scrapeNitter(nitterQueries);
+        results.nitter.found = nitterEvents.length;
+        console.log(`[Nitter] fallback found ${nitterEvents.length} candidates`);
+      } catch (e) {
+        results.nitter.errors = String(e);
+        console.error('[Nitter] failed:', e);
+      }
+    }
+
     // ---- Phase 2: Process all events through pipeline ----
     const allRaw = [
       ...enrichedLuma.map(e => ({ ...e, _source: 'luma' as const })),
@@ -1406,6 +1661,7 @@ Deno.serve(async () => {
       ...meetupEvents.map(e => ({ ...e, _source: 'meetup' as const })),
       ...xDiscoveredEvents.map(e => ({ ...e, _source: 'x_discovery' as const })),
       ...xTweetEvents.map(e => ({ ...e, _source: 'x' as const })),
+      ...nitterEvents.map(e => ({ ...e, _source: 'nitter' as const })),
     ];
 
     console.log(`Total raw candidates: ${allRaw.length} (max 50 will be processed)`);
@@ -1436,8 +1692,13 @@ Deno.serve(async () => {
         duplicates_skipped: stats.duplicates,
         errors: stats.errors || null,
         gate_rejections: stats.gate_rejections || {},
-      });
     }
+
+    // v11 — after logs are persisted, run self-tuning + dispatch yield alerts
+    await autoTuneThresholds(supabase);
+    await maybeSendYieldAlerts(supabase);
+
+
 
     // Mark past events as completed
     await supabase
