@@ -1550,6 +1550,9 @@ Deno.serve(async () => {
     const firecrawlApiKey = Deno.env.get('FIRECRAWL_API_KEY') || '';
     const supabase = createClient(supabaseUrl, supabaseKey);
 
+    // v11 — load auto-tuned thresholds before any AI gating runs
+    await loadThresholds(supabase);
+
     const emptyStats = () => ({ found: 0, inserted: 0, duplicates: 0, filtered_keyword: 0, filtered_ai: 0, filtered_gate: 0, errors: '' });
     const results: Record<string, any> = {
       luma: emptyStats(),
@@ -1557,6 +1560,7 @@ Deno.serve(async () => {
       meetup: emptyStats(),
       x: emptyStats(),                // tweet-native (discovery mode)
       x_discovery: emptyStats(),      // outbound links enriched (structured mode)
+      nitter: emptyStats(),           // v11 — Nitter fallback for X
     };
 
     // ---- Phase 1: Scrape structured platforms in parallel ----
