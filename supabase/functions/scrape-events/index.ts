@@ -1692,8 +1692,13 @@ Deno.serve(async () => {
         duplicates_skipped: stats.duplicates,
         errors: stats.errors || null,
         gate_rejections: stats.gate_rejections || {},
-      });
     }
+
+    // v11 — after logs are persisted, run self-tuning + dispatch yield alerts
+    await autoTuneThresholds(supabase);
+    await maybeSendYieldAlerts(supabase);
+
+
 
     // Mark past events as completed
     await supabase
