@@ -1,18 +1,22 @@
 ---
-name: Automation pipeline v10 — Gate telemetry, source-weighted confidence, title hygiene
-description: v10 adds per-gate rejection counters, lowers confidence to 0.75 for trusted structured sources (luma/eventbrite/meetup/partiful), cleans tweet-cruft titles, rejects fragment titles
+name: Automation pipeline v12 — Firecrawl rate limiting, provider-block detection, Nitter hardening
+description: v12 fixes the syntax error that blocked v11 deploys, serializes all Firecrawl calls behind a 14 req/min queue, detects HTTP 402 credit exhaustion, treats nitter as a discovery source, and rejects fake "not whitelisted" RSS feeds
 type: feature
 ---
-## Pipeline (v10)
+## Pipeline (v12)
 ```
-Scrape → Normalize → cleanDisplayTitle → isLowQualityTitle gate → Page Type Gate → Web3 Keyword → [DISCOVERY: Intent + Score≥2 + past-meta-date] → AI → Final Validator (source-weighted conf: 0.75 trusted / 0.85 discovery, past-date, anti-drift) → Dedup → Insert
+Scrape (rate-limited Firecrawl queue) → Normalize → cleanDisplayTitle → title gate → Page Type Gate (structured|discovery) → Web3 keyword → [DISCOVERY: intent + score≥2 + past-meta-date] → AI → Final Validator (per-source threshold from pipeline_config) → Dedup → Insert
 ```
 
-## v10 Changes
-- **Per-gate telemetry** — `scrape_logs.gate_rejections jsonb` records `{gate_name: count}`. `bumpGate(stats, name)` at every rejection. Gates: `title_too_short`, `low_quality_title`, `page_type:*`, `web3_keyword`, `discovery_no_intent`, `discovery_low_score`, `past_metadata_date`, `ai_unavailable`, `ai_failed`, `ai_not_event`, `ai_listicle`, `ai_uncertain`, `past_date`, `ai_low_confidence`, `no_date`, `no_location`, `no_registration`.
-- **Source-weighted confidence** — `HIGH_TRUST = {luma, eventbrite, meetup, partiful}` → threshold 0.75. Others (x, x_discovery, community) → 0.85. Unblocks lu.ma drought (429 found / 0 inserted over 30d).
-- **Title hygiene** — `cleanDisplayTitle()` strips `/ Posts / X`, `- Twitter`, `(@handle)`, caps at 140 chars. `isLowQualityTitle()` rejects question fragments <60 chars, mid-sentence ellipsis without event noun, profile-page titles.
-- **finalValidate returns `gate`** for telemetry tagging.
+## v12 Changes
+- **Deploy blocker fixed** — `scrape_logs` insert block was missing `});`, so the whole v11 feature set (auto-tune, Nitter, telemetry) never shipped.
+- **Firecrawl rate limiter** — `fcRequest(path, body, key)` serializes ALL Firecrawl traffic with a 4.3s gap (~14 req/min) plus one 429 backoff retry. Parallel fan-out previously 429'd every call, so every source reported `found=0`. Query counts trimmed (Luma 4, X 4) to fit the budget; X no longer does two searches per query.
+- **Provider-block detection** — HTTP 402 sets `fcState.outOfCredits`, aborts remaining scraping, writes a `pipeline_alerts` row (`reason='provider_out_of_credits'`), returns `provider_blocked` in the response, and SKIPS auto-tuning so thresholds don't drift on meaningless zero-yield runs.
+- **`nitter` is a discovery platform** — was classified structured, so every candidate died as `page_type:blocked domain` (x.com).
+- **Nitter guard** — instances (xcancel etc.) answer HTTP 200 with "RSS reader not yet whitelisted!"; that body is now treated as a failure instead of 5 fake events.
+
+## Known external constraint
+Firecrawl credits are exhausted (HTTP 402). No source can yield events until the plan is topped up — code-side gates are not the current bottleneck.
 
 ## Untouched
-v9 intent/signal gates · Dedup logic · Firecrawl scraping · X dual-output · placeholder upgrade flow · 0.85 discovery threshold.
+v9 intent/signal gates · v10 title hygiene + gate telemetry · v11 pipeline_config auto-tune + yield alerts · Dedup logic · placeholder upgrade flow.
