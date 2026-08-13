@@ -39,6 +39,11 @@ export function EventCard({ event }: { event: Event }) {
                 Pending review
               </Badge>
             )}
+            {event.status === "completed" && (
+              <Badge variant="outline" className="border-border bg-muted text-muted-foreground">
+                Past
+              </Badge>
+            )}
           </div>
           {event.confidence_score && (
             <span className="shrink-0 text-xs text-muted-foreground">

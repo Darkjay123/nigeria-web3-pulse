@@ -310,7 +310,9 @@ function isPastDate(date: string | null): boolean {
 const AI_UNCERTAIN_RE = /\b(maybe|unclear|uncertain|might\s+be|possibly|recap|past\s+event|already\s+happened|retrospective|reflection|history|throwback)\b/i;
 
 const STRUCTURED_PLATFORMS = new Set(["luma", "eventbrite", "meetup", "partiful", "community"]);
-const DISCOVERY_PLATFORMS = new Set(["x", "x_discovery", "twitter", "reddit", "discord"]);
+// v12: 'nitter' is an X mirror — it MUST be treated as discovery, otherwise the
+// structured gate rejects every candidate as "blocked domain: x.com".
+const DISCOVERY_PLATFORMS = new Set(["x", "x_discovery", "twitter", "nitter", "reddit", "discord"]);
 
 function classifySource(platform: string): "structured" | "discovery" {
   if (DISCOVERY_PLATFORMS.has(platform)) return "discovery";
@@ -713,6 +715,54 @@ async function isDuplicateEvent(
 
 const FIRECRAWL_API_URL = "https://api.firecrawl.dev/v1";
 
+// v12 — ROOT CAUSE FIX for the empty pipeline.
+// The Firecrawl plan allows ~15 requests/minute. Every search/enrich call was
+// fired in parallel, so the whole run 429'd and every source reported 0 found.
+// All Firecrawl traffic now goes through one serialized, rate-limited queue.
+const FC_MIN_GAP_MS = 4300; // ~14 req/min
+let fcChain: Promise<unknown> = Promise.resolve();
+let fcLastAt = 0;
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function fcRequest(path: string, body: unknown, apiKey: string): Promise<any | null> {
+  const run = async (): Promise<any | null> => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const wait = FC_MIN_GAP_MS - (Date.now() - fcLastAt);
+      if (wait > 0) await sleep(wait);
+      fcLastAt = Date.now();
+      try {
+        const resp = await fetch(`${FIRECRAWL_API_URL}${path}`, {
+          method: "POST",
+          headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (resp.status === 429) {
+          console.warn(`[Firecrawl] 429 on ${path} (attempt ${attempt + 1}) — backing off`);
+          await sleep(12000);
+          continue;
+        }
+        if (!resp.ok) {
+          console.error(`[Firecrawl] ${path} failed: ${resp.status}`);
+          return null;
+        }
+        return await resp.json();
+      } catch (e) {
+        console.error(`[Firecrawl] ${path} error:`, e);
+        return null;
+      }
+    }
+    return null;
+  };
+  // Serialize: each call waits for the previous one to finish.
+  const result = fcChain.then(run, run);
+  fcChain = result.catch(() => null);
+  return result;
+}
+
+
 // Parse JSON-LD Event blocks out of raw HTML — works for lu.ma, eventbrite, meetup, etc.
 function extractJsonLdEvent(rawHtml: string): {
   event_date: string | null;
@@ -767,22 +817,9 @@ function extractJsonLdEvent(rawHtml: string): {
 async function enrichLink(link: string, firecrawlApiKey: string): Promise<any | null> {
   try {
     console.log(`[Enrich] Scraping: ${link}`);
-    const resp = await fetch(`${FIRECRAWL_API_URL}/scrape`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${firecrawlApiKey}`,
-        "Content-Type": "application/json",
-      },
-      // rawHtml gives us JSON-LD; markdown is human readable backup
-      body: JSON.stringify({ url: link, formats: ["markdown", "rawHtml"] }),
-    });
-
-    if (!resp.ok) {
-      console.error(`[Enrich] Failed: ${resp.status}`);
-      return null;
-    }
-
-    const data = await resp.json();
+    // rawHtml gives us JSON-LD; markdown is human readable backup
+    const data = await fcRequest('/scrape', { url: link, formats: ["markdown", "rawHtml"] }, firecrawlApiKey);
+    if (!data) return null;
     const result = data.data || data;
     const markdown = result.markdown || "";
     const rawHtml = result.rawHtml || result.html || "";
@@ -830,50 +867,23 @@ async function discoverFromXTwitter(firecrawlApiKey: string): Promise<{
 }> {
   const outboundLinks: string[] = [];
   const tweetEvents: any[] = [];
+  // v12: trimmed to 4 queries — the Firecrawl plan only allows ~15 req/min and
+  // the run also needs budget for Luma search plus link enrichment.
   const queries = [
     'site:x.com "web3" Lagos OR Nigeria',
     'site:x.com "blockchain meetup" Nigeria',
-    'site:x.com "twitter space" web3 Africa',
-    'site:x.com "hosting" web3 OR crypto Lagos',
-    'site:x.com "RSVP" OR "join us" crypto Nigeria',
-    'site:x.com "AMA" blockchain Africa',
+    'site:x.com "hosting" OR "join us" web3 OR crypto Lagos',
+    'site:x.com "twitter space" OR "AMA" web3 Nigeria OR Africa',
   ];
 
-  // Run Firecrawl searches in parallel — was sequential, killing latency
-  const searchPromises = queries.map(query =>
-    fetch(`${FIRECRAWL_API_URL}/search`, {
-      method: "POST",
-      headers: { "Authorization": `Bearer ${firecrawlApiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ query, limit: 5, scrapeOptions: { formats: ["markdown"] } }),
-    }).then(r => r.ok ? r.json() : null).catch(() => null)
-  );
-  const searchResults = await Promise.all(searchPromises);
-
-  for (let qi = 0; qi < queries.length; qi++) {
-    const query = queries[qi];
-    const data = searchResults[qi];
+  for (const query of queries) {
+    console.log(`[X Discovery] Searching: "${query}"`);
+    // Single rate-limited search per query (was doing two searches per query).
+    const data = await fcRequest('/search', { query, limit: 6, scrapeOptions: { formats: ["markdown"] } }, firecrawlApiKey);
     if (!data) { console.error(`[X Discovery] Failed for "${query}"`); continue; }
     try {
-      console.log(`[X Discovery] Searching: "${query}"`);
-      const resp = await fetch(`${FIRECRAWL_API_URL}/search`, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${firecrawlApiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          query,
-          limit: 6,
-          scrapeOptions: { formats: ["markdown"] },
-        }),
-      });
-
-      if (!resp.ok) {
-        console.error(`[X Discovery] Failed for "${query}": ${resp.status}`);
-        continue;
-      }
-
       const results = data.data || [];
+
 
       for (const r of results) {
         const tweetUrl: string = r.url || r.metadata?.sourceURL || "";
@@ -926,25 +936,22 @@ async function scrapeLumaEvents(firecrawlApiKey: string): Promise<any[]> {
   const queries = [
     'site:lu.ma web3 nigeria',
     'site:lu.ma blockchain lagos',
-    'site:lu.ma crypto africa',
-    'site:lu.ma defi nigeria',
+    'site:lu.ma crypto africa OR abuja',
+    'site:lu.ma web3 lagos meetup OR hackathon',
   ];
 
   const seen = new Set<string>();
-  // Parallelize Luma searches
-  const searchResults = await Promise.all(queries.map(query =>
-    fetch(`${FIRECRAWL_API_URL}/search`, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${firecrawlApiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, limit: 5 }),
-    }).then(r => r.ok ? r.json() : null).catch(() => null)
-  ));
+  // v12: rate-limited, serialized searches (parallel calls tripped Firecrawl's 429).
+  const searchResults: any[] = [];
+  for (const query of queries) {
+    searchResults.push(await fcRequest('/search', { query, limit: 8 }, firecrawlApiKey));
+  }
   for (const data of searchResults) {
     if (!data) continue;
     const results = data.data || [];
     for (const r of results) {
       const url: string = r.url || r.metadata?.sourceURL || '';
-      if (!/^https?:\/\/lu\.ma\/[a-z0-9-]{4,}$/i.test(url)) continue;
+      if (!/^https?:\/\/lu\.ma\/(e\/)?[A-Za-z0-9_-]{3,}$/i.test(url)) continue;
       if (seen.has(url)) continue;
       seen.add(url);
       const title: string = r.title || r.metadata?.title || '';
@@ -1309,6 +1316,13 @@ async function scrapeNitter(queries: string[]): Promise<any[]> {
         const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
         if (r.ok) {
           const body = await r.text();
+          // v12: xcancel and friends answer with a 200 "RSS reader not yet
+          // whitelisted!" feed. That is a failure, not 5 events — skip it,
+          // otherwise the pipeline burns AI budget on garbage.
+          if (/not\s+yet\s+whitelisted|rate\s*limit|instance\s+has\s+been\s+blocked/i.test(body)) {
+            console.warn(`[Nitter] ${inst} rejected our reader for "${query}"`);
+            continue;
+          }
           if (body.includes('<item>') || body.includes('<item ')) {
             xml = body; used = inst; break;
           }
@@ -1692,6 +1706,7 @@ Deno.serve(async () => {
         duplicates_skipped: stats.duplicates,
         errors: stats.errors || null,
         gate_rejections: stats.gate_rejections || {},
+      });
     }
 
     // v11 — after logs are persisted, run self-tuning + dispatch yield alerts
