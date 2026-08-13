@@ -1804,6 +1804,7 @@ Deno.serve(async () => {
 
     return new Response(JSON.stringify({
       ok: true,
+      provider_blocked: fcState.outOfCredits ? fcState.lastError : null,
       scrape_results: results,
       submissions: { processed: submissionsProcessed, accepted: submissionsAccepted },
       total_found: totalFound,
