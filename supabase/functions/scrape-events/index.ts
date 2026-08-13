@@ -1715,14 +1715,27 @@ Deno.serve(async () => {
         events_found: stats.found,
         events_inserted: stats.inserted,
         duplicates_skipped: stats.duplicates,
-        errors: stats.errors || null,
+        errors: (stats.errors || '') + (fcState.outOfCredits ? ` ${fcState.lastError}` : '') || null,
         gate_rejections: stats.gate_rejections || {},
       });
     }
 
-    // v11 — after logs are persisted, run self-tuning + dispatch yield alerts
-    await autoTuneThresholds(supabase);
-    await maybeSendYieldAlerts(supabase);
+    // v12 — when the scraping provider is out of credits, a zero-yield run says
+    // nothing about our gates. Record it loudly and skip auto-tuning so
+    // thresholds don't drift on meaningless data.
+    if (fcState.outOfCredits) {
+      console.error('[v12] PROVIDER BLOCKED:', fcState.lastError);
+      await supabase.from('pipeline_alerts').upsert({
+        source: 'firecrawl',
+        last_alert_at: new Date().toISOString(),
+        reason: 'provider_out_of_credits',
+        payload: { message: fcState.lastError },
+      });
+    } else {
+      // v11 — after logs are persisted, run self-tuning + dispatch yield alerts
+      await autoTuneThresholds(supabase);
+      await maybeSendYieldAlerts(supabase);
+    }
 
 
 
