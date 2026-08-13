@@ -74,9 +74,9 @@ export function EventCard({ event }: { event: Event }) {
           {event.title}
         </h3>
 
-        {event.description && (
-          <p className="mb-4 line-clamp-2 text-sm text-muted-foreground">
-            {event.description}
+        {description && (
+          <p className="mb-4 line-clamp-3 text-sm text-muted-foreground">
+            {description}
           </p>
         )}
 
