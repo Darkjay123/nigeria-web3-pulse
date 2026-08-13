@@ -16,10 +16,28 @@ function getEventTypeColor(type: string) {
   return map[type] || "bg-muted text-muted-foreground border-border";
 }
 
+// Scraped descriptions (especially from X) carry markdown links, image captions,
+// author/likes metadata and hashtag walls. Clean that up for display only.
+function cleanDescription(raw: string) {
+  return raw
+    .replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g, "$1")
+    .replace(/https?:\/\/\S+/g, "")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/^>\s?/gm, "")
+    .replace(/\b(Author|Posted|URL|Likes|Retweets|Replies)\s*:\s*[^\n·|]*/gi, "")
+    .replace(/[^\s]+'s Image on X\.?/gi, "")
+    .replace(/&amp;/g, "&")
+    .replace(/#[\w]+/g, "")
+    .replace(/[·|]+/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
 export function EventCard({ event }: { event: Event }) {
   const dateStr = event.event_date
     ? format(parseISO(event.event_date), "MMM d, yyyy")
     : "TBD";
+  const description = event.description ? cleanDescription(event.description) : "";
 
   return (
     <Card className="group border-border bg-card transition-all duration-300 card-glow-hover hover:border-primary/40">
@@ -39,6 +57,11 @@ export function EventCard({ event }: { event: Event }) {
                 Pending review
               </Badge>
             )}
+            {event.status === "completed" && (
+              <Badge variant="outline" className="border-border bg-muted text-muted-foreground">
+                Past
+              </Badge>
+            )}
           </div>
           {event.confidence_score && (
             <span className="shrink-0 text-xs text-muted-foreground">
@@ -51,9 +74,9 @@ export function EventCard({ event }: { event: Event }) {
           {event.title}
         </h3>
 
-        {event.description && (
-          <p className="mb-4 line-clamp-2 text-sm text-muted-foreground">
-            {event.description}
+        {description && (
+          <p className="mb-4 line-clamp-3 text-sm text-muted-foreground">
+            {description}
           </p>
         )}
 

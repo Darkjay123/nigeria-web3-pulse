@@ -64,6 +64,16 @@ function EventsPage() {
     return true;
   });
 
+  // Upcoming/pending first (soonest date first), past events last.
+  const rank = (e: Event) => (e.status === "completed" ? 1 : 0);
+  const sorted = [...filtered].sort((a, b) => {
+    const r = rank(a) - rank(b);
+    if (r !== 0) return r;
+    const da = a.event_date ?? "9999-12-31";
+    const db = b.event_date ?? "9999-12-31";
+    return rank(a) === 1 ? db.localeCompare(da) : da.localeCompare(db);
+  });
+
   return (
     <div className="min-h-screen bg-background">
       <div className="mx-auto max-w-7xl px-4 py-10 space-y-8">
@@ -89,7 +99,7 @@ function EventsPage() {
           </div>
         ) : (
           <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-            {filtered.map((event) => (
+            {sorted.map((event) => (
               <EventCard key={event.id} event={event} />
             ))}
           </div>
