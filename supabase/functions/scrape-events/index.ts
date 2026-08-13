@@ -722,6 +722,9 @@ const FIRECRAWL_API_URL = "https://api.firecrawl.dev/v1";
 const FC_MIN_GAP_MS = 4300; // ~14 req/min
 let fcChain: Promise<unknown> = Promise.resolve();
 let fcLastAt = 0;
+// Set when the provider answers 402/insufficient credits. Every later call
+// short-circuits so the run ends fast instead of grinding through backoffs.
+export const fcState = { outOfCredits: false, lastError: '' };
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
@@ -729,6 +732,7 @@ function sleep(ms: number) {
 
 async function fcRequest(path: string, body: unknown, apiKey: string): Promise<any | null> {
   const run = async (): Promise<any | null> => {
+    if (fcState.outOfCredits) return null;
     for (let attempt = 0; attempt < 2; attempt++) {
       const wait = FC_MIN_GAP_MS - (Date.now() - fcLastAt);
       if (wait > 0) await sleep(wait);
@@ -744,8 +748,15 @@ async function fcRequest(path: string, body: unknown, apiKey: string): Promise<a
           await sleep(12000);
           continue;
         }
+        if (resp.status === 402) {
+          fcState.outOfCredits = true;
+          fcState.lastError = 'Firecrawl credits exhausted (HTTP 402) — no source can be scraped until the plan is topped up.';
+          console.error(`[Firecrawl] OUT OF CREDITS — aborting all scraping for this run`);
+          return null;
+        }
         if (!resp.ok) {
           console.error(`[Firecrawl] ${path} failed: ${resp.status}`);
+          fcState.lastError = `Firecrawl ${path} HTTP ${resp.status}`;
           return null;
         }
         return await resp.json();
