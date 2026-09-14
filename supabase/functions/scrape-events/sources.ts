@@ -69,220 +69,214 @@ function splitIso(iso: string | null | undefined): {
 }
 
 // ---------------------------------------------------------------- Luma -----
-// lu.ma city pages ship the full event list inside __NEXT_DATA__ — name,
-// start/end, location type and slug. No key, no credits, one request per city.
-const LUMA_CITY_PAGES = [
-  "https://lu.ma/lagos",
-  "https://lu.ma/abuja",
-  "https://lu.ma/nigeria",
-  "https://lu.ma/port-harcourt",
-];
 
-export async function fetchLumaCityEvents(): Promise<RawCandidate[]> {
-  const out: RawCandidate[] = [];
-  const seen = new Set<string>();
+const fetchText = getText;
 
-  const pages = await Promise.all(LUMA_CITY_PAGES.map((u) => getText(u)));
-
-  for (const html of pages) {
-    if (!html) continue;
-    const data = nextData(html);
-    const entries =
-      data?.props?.pageProps?.initialData?.data?.events ??
-      data?.props?.pageProps?.initialData?.data?.entries ??
-      [];
-    for (const entry of entries) {
-      const ev = entry?.event ?? entry;
-      if (!ev?.name) continue;
-      const slug = ev.url ? `https://lu.ma/${ev.url}` : null;
-      const key = slug || ev.api_id;
-      if (!key || seen.has(key)) continue;
-      seen.add(key);
-
-      const start = splitIso(ev.start_at);
-      const end = splitIso(ev.end_at);
-      const geo = entry?.calendar ?? ev?.geo_address_info ?? {};
-      const city =
-        ev?.geo_address_info?.city_state ||
-        ev?.geo_address_info?.city ||
-        entry?.geo_address_info?.city ||
-        null;
-
-      out.push({
-        title: String(ev.name).trim(),
-        description: String(ev.description_short || geo?.description || "").trim(),
-        source_url: slug,
-        registration_link: slug,
-        source_platform: "luma",
-        venue:
-          ev?.geo_address_info?.address ||
-          ev?.geo_address_info?.full_address ||
-          null,
-        city,
-        event_date: start.date,
-        event_time: start.time,
-        end_date: end.date,
-        organizer: entry?.calendar?.name || null,
-        is_online: ev.location_type === "online" || ev.location_type === "virtual",
-        image_url: ev.cover_url || null,
-        metadata: { event_date: start.date },
-        trusted_metadata: !!start.date,
-      });
+async function fetchJson<T>(url: string, timeoutMs = 12000): Promise<T | null> {
+  try {
+    const r = await fetch(url, {
+      headers: { "User-Agent": UA, Accept: "application/json" },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!r.ok) {
+      console.warn(`[fetch] ${r.status} ${url}`);
+      return null;
     }
+    return (await r.json()) as T;
+  } catch (e) {
+    console.warn(`[fetch] failed ${url}: ${e}`);
+    return null;
   }
-
-  console.log(`[Luma] ${out.length} candidates from ${LUMA_CITY_PAGES.length} city pages`);
-  return out;
 }
 
-// -------------------------------------------------------------- Meetup -----
-// Meetup's search page embeds the Apollo result set in __NEXT_DATA__, with
-// title, eventUrl, dateTime and venue. The old JSON-LD scrape returned nothing.
-const MEETUP_SEARCHES = [
-  "https://www.meetup.com/find/?keywords=web3&location=ng--Lagos&source=EVENTS",
-  "https://www.meetup.com/find/?keywords=blockchain&location=ng--Lagos&source=EVENTS",
-  "https://www.meetup.com/find/?keywords=crypto&location=ng--Abuja&source=EVENTS",
-  "https://www.meetup.com/find/?keywords=web3&location=ng--Abuja&source=EVENTS",
-];
-
-export async function fetchMeetupEvents(): Promise<RawCandidate[]> {
-  const out: RawCandidate[] = [];
-  const seen = new Set<string>();
-
-  const pages = await Promise.all(MEETUP_SEARCHES.map((u) => getText(u, 15000)));
-
-  for (const html of pages) {
-    if (!html) continue;
-    const data = nextData(html);
-    if (!data) continue;
-    const blob = JSON.stringify(data);
-
-    // Apollo normalises every event into its own object; pull them by shape
-    // rather than by a brittle path that changes between Meetup releases.
-    const nodes = blob.match(/\{"__typename":"Event".*?\}(?=,"|\})/g) || [];
-    const seenUrls = new Set<string>();
-    for (const node of nodes) {
-      const url = node.match(/"eventUrl":"([^"]+)"/)?.[1];
-      const title = node.match(/"title":"([^"]+)"/)?.[1];
-      const when = node.match(/"dateTime":"([^"]+)"/)?.[1];
-      const end = node.match(/"endTime":"([^"]+)"/)?.[1];
-      const desc = node.match(/"description":"([^"]{0,900})"/)?.[1] || "";
-      const group = node.match(/"name":"([^"]+)"/)?.[1] || null;
-      const venue = node.match(/"venue":\{[^}]*"name":"([^"]+)"/)?.[1] || null;
-      const city = node.match(/"city":"([^"]+)"/)?.[1] || null;
-      const online = /"eventType":"ONLINE"/.test(node);
-      if (!url || !title || seenUrls.has(url)) continue;
-      seenUrls.add(url);
-      if (seen.has(url)) continue;
-      seen.add(url);
-
-      const start = splitIso(when);
-      out.push({
-        title: JSON.parse(`"${title}"`),
-        description: desc ? JSON.parse(`"${desc}"`) : "",
-        source_url: url,
-        registration_link: url,
-        source_platform: "meetup",
-        venue,
-        city,
-        event_date: start.date,
-        event_time: start.time,
-        end_date: splitIso(end).date,
-        organizer: group,
-        is_online: online,
-        metadata: { event_date: start.date },
-        trusted_metadata: !!start.date,
-      });
-    }
-  }
-
-  console.log(`[Meetup] ${out.length} candidates from ${MEETUP_SEARCHES.length} searches`);
-  return out;
-}
-
-// ------------------------------------------------------ JSON-LD scraper -----
-// Community calendars and org sites that publish schema.org Event markup.
-// Cheap, deterministic, no provider in the middle.
-export const COMMUNITY_CALENDARS = [
-  "https://www.web3lagos.com/",
-  "https://blockchainnigeria.com/events/",
-];
-
-export function extractJsonLdEvents(html: string, sourceUrl: string): RawCandidate[] {
-  const out: RawCandidate[] = [];
-  const blocks =
-    html.matchAll(
-      /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi,
-    ) || [];
-  for (const b of blocks) {
-    let parsed: any;
-    try {
-      parsed = JSON.parse(b[1].trim());
-    } catch {
-      continue;
-    }
-    const items = Array.isArray(parsed) ? parsed : parsed["@graph"] || [parsed];
-    for (const item of items) {
-      const t = item?.["@type"];
-      const isEvent =
-        t === "Event" ||
-        (Array.isArray(t) && t.includes("Event")) ||
-        (typeof t === "string" && /Event$/.test(t));
-      if (!isEvent || !item.name) continue;
-      const start = splitIso(item.startDate);
-      const url = item.url || sourceUrl;
-      out.push({
-        title: String(item.name).trim(),
-        description: String(item.description || "").substring(0, 1500),
-        source_url: url,
-        registration_link: item.offers?.url || url,
-        source_platform: "community",
-        venue: item.location?.name || null,
-        city:
-          item.location?.address?.addressLocality ||
-          item.location?.address?.addressRegion ||
-          null,
-        event_date: start.date,
-        event_time: start.time,
-        end_date: splitIso(item.endDate).date,
-        organizer:
-          item.organizer?.name ||
-          (typeof item.organizer === "string" ? item.organizer : null),
-        is_online:
-          String(item.eventAttendanceMode || "").includes("Online") ||
-          item.location?.["@type"] === "VirtualLocation",
-        image_url: typeof item.image === "string" ? item.image : item.image?.[0] || null,
-        metadata: { event_date: start.date },
-        trusted_metadata: !!start.date,
-      });
-    }
-  }
-  return out;
-}
-
-export async function fetchCommunityCalendars(
-  urls: string[] = COMMUNITY_CALENDARS,
-): Promise<RawCandidate[]> {
-  const pages = await Promise.all(
-    urls.map(async (u) => ({ url: u, html: await getText(u) })),
-  );
-  const out: RawCandidate[] = [];
-  for (const p of pages) {
-    if (!p.html) continue;
-    out.push(...extractJsonLdEvents(p.html, p.url));
-  }
-  console.log(`[Community] ${out.length} candidates from ${urls.length} calendars`);
-  return out;
-}
-
-// -------------------------------------------------------------- Nitter -----
-// Kept from v12, still free, still discovery-mode only.
 const NITTER_INSTANCES = [
   "nitter.privacydev.net",
   "nitter.poast.org",
   "xcancel.com",
   "nitter.net",
 ];
+
+function normalizeCity(raw: string): string | null {
+  const v = (raw || "").split(",")[0].trim();
+  if (!v) return null;
+  return v.replace(/\s+/g, " ").slice(0, 60);
+}
+
+export async function fetchLumaCityEvents(): Promise<RawCandidate[]> {
+  // lu.ma's public discovery API. Keyword queries beat city pages: a city page is
+  // whatever is trending there, while these return Nigeria-wide web3 events with
+  // full structured metadata (start_at, geo, cover, url) and no API key.
+  const QUERIES = [
+    'nigeria',
+    'lagos web3',
+    'abuja blockchain',
+    'nigeria crypto',
+    'nigeria blockchain',
+    'lagos crypto',
+    'port harcourt tech',
+    'african web3',
+  ];
+
+  const seen = new Set<string>();
+  const out: RawCandidate[] = [];
+
+  const pages = await Promise.all(
+    QUERIES.map((q) =>
+      fetchJson<LumaDiscoverResponse>(
+        `https://api.lu.ma/discover/get-paginated-events?period=future&pagination_limit=50&query=${encodeURIComponent(q)}`,
+      ).catch(() => null),
+    ),
+  );
+
+  for (let i = 0; i < pages.length; i++) {
+    const entries = pages[i]?.entries ?? [];
+    for (const entry of entries) {
+      const ev = (entry as any)?.event ?? entry;
+      const apiId: string | undefined = ev?.api_id;
+      const url: string | undefined = ev?.url ? `https://lu.ma/${ev.url}` : undefined;
+      const key = apiId ?? url;
+      if (!key || seen.has(key) || !url) continue;
+
+      const geo = ev?.geo_address_info ?? {};
+      const cityState: string = geo?.city_state ?? '';
+      const country: string = geo?.country ?? '';
+      const address: string = geo?.full_address ?? geo?.address ?? '';
+      const haystack = `${cityState} ${country} ${address}`.toLowerCase();
+
+      const isOnline = ev?.location_type === 'online' || ev?.location_type === 'zoom';
+      const nigerian =
+        /nigeria|lagos|abuja|ibadan|benin city|port harcourt|enugu|kano|ilorin|calabar|uyo|abeokuta|jos|owerri|awka|akure|zaria|kaduna|asaba|warri/.test(
+          haystack,
+        ) || /\bnigeria\b|\blagos\b|\babuja\b/.test(String(ev?.name ?? '').toLowerCase());
+
+      // Online events only count when the title/host ties them to Nigeria, or we
+      // would import the whole global calendar.
+      if (!nigerian && !isOnline) continue;
+      if (!nigerian && isOnline) continue;
+
+      seen.add(key);
+      const { date, time } = splitIso(ev?.start_at);
+      out.push({
+        title: String(ev?.name ?? '').trim(),
+        description: String(ev?.description_short ?? ev?.one_liner ?? '').trim(),
+        event_date: date,
+        event_time: time,
+        venue: ev?.geo_address_info?.address ?? null,
+        city: normalizeCity(cityState || address),
+        is_online: isOnline,
+        registration_link: url,
+        source_platform: 'luma',
+        source_url: url,
+        image_url: ev?.cover_url ?? null,
+        organizer: (entry as any)?.calendar?.name ?? null,
+        trusted_metadata: Boolean(date),
+      });
+    }
+  }
+
+  console.log(`[Luma] ${out.length} Nigerian candidates from ${QUERIES.length} discovery queries`);
+  return out;
+}
+
+interface LumaDiscoverResponse {
+  entries?: unknown[];
+  has_more?: boolean;
+}
+
+export async function fetchMeetupEvents(): Promise<RawCandidate[]> {
+  const SEARCHES = [
+    'https://www.meetup.com/find/?keywords=web3&location=ng--Lagos&source=EVENTS',
+    'https://www.meetup.com/find/?keywords=blockchain&location=ng--Lagos&source=EVENTS',
+    'https://www.meetup.com/find/?keywords=crypto&location=ng--Abuja&source=EVENTS',
+    'https://www.meetup.com/find/?keywords=blockchain&location=ng--Nigeria&source=EVENTS',
+  ];
+
+  const seen = new Set<string>();
+  const out: RawCandidate[] = [];
+
+  const pages = await Promise.all(SEARCHES.map((u) => fetchText(u).catch(() => null)));
+
+  for (const html of pages) {
+    if (!html) continue;
+    const data = extractNextData(html);
+    if (!data) continue;
+
+    // Walk the whole payload instead of regex-slicing it: Meetup reshapes this
+    // blob often, but an event object always carries an eventUrl plus a start time.
+    for (const node of walkObjects(data)) {
+      const url = typeof node.eventUrl === 'string' ? node.eventUrl : null;
+      if (!url || !url.includes('/events/')) continue;
+      const title = typeof node.title === 'string' ? node.title : typeof node.name === 'string' ? node.name : '';
+      if (!title) continue;
+      const iso =
+        (typeof node.dateTime === 'string' && node.dateTime) ||
+        (typeof node.startTime === 'string' && node.startTime) ||
+        null;
+      const clean = url.split('?')[0];
+      if (seen.has(clean)) continue;
+      seen.add(clean);
+
+      const venueObj = (node.venue ?? {}) as Record<string, unknown>;
+      const city = typeof venueObj.city === 'string' ? venueObj.city : null;
+      const { date, time } = splitIso(iso);
+
+      out.push({
+        title: title.trim(),
+        description: typeof node.description === 'string' ? node.description.slice(0, 600) : '',
+        event_date: date,
+        event_time: time,
+        venue: typeof venueObj.name === 'string' ? venueObj.name : null,
+        city: normalizeCity(city ?? ''),
+        is_online: node.eventType === 'ONLINE' || node.isOnline === true,
+        registration_link: clean,
+        source_platform: 'meetup',
+        source_url: clean,
+        image_url: null,
+        organizer: typeof (node.group as any)?.name === 'string' ? (node.group as any).name : null,
+        trusted_metadata: Boolean(date),
+      });
+    }
+  }
+
+  console.log(`[Meetup] ${out.length} candidates from ${SEARCHES.length} searches`);
+  return out;
+}
+
+const extractNextData = nextData;
+
+function* walkObjects(root: unknown, depth = 0): Generator<Record<string, any>> {
+  if (depth > 14 || root === null || typeof root !== 'object') return;
+  if (Array.isArray(root)) {
+    for (const item of root) yield* walkObjects(item, depth + 1);
+    return;
+  }
+  yield root as Record<string, any>;
+  for (const value of Object.values(root as Record<string, unknown>)) {
+    if (value && typeof value === 'object') yield* walkObjects(value, depth + 1);
+  }
+}
+
+export async function fetchCommunityCalendars(feeds: string[] = []): Promise<RawCandidate[]> {
+  // Deliberately empty by default. Community calendar URLs are operator data, not
+  // code: the pipeline passes in whatever is configured, so a dead domain can be
+  // swapped without a redeploy and we never ship a guessed URL.
+  if (!feeds.length) {
+    console.log('[Community] no calendars configured, skipping lane');
+    return [];
+  }
+
+  const out: RawCandidate[] = [];
+  const pages = await Promise.all(feeds.map((u) => fetchText(u).catch(() => null)));
+
+  for (let i = 0; i < pages.length; i++) {
+    const html = pages[i];
+    if (!html) continue;
+    out.push(...extractJsonLdEvents(html, feeds[i]));
+  }
+
+  console.log(`[Community] ${out.length} candidates from ${feeds.length} calendars`);
+  return out;
+}
 
 export async function fetchNitter(queries: string[]): Promise<RawCandidate[]> {
   const tweets: RawCandidate[] = [];
