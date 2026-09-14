@@ -1,4 +1,11 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import {
+  fetchLumaCityEvents,
+  fetchMeetupEvents,
+  fetchCommunityCalendars,
+  fetchNitter,
+  type RawCandidate,
+} from './sources.ts';
 
 // ============ CONSTANTS ============
 
@@ -656,59 +663,75 @@ async function generateDedupHash(title: string, date: string | null, state: stri
   return hashArray.map(b => b.toString(16).padStart(2, '0')).join('').substring(0, 32);
 }
 
-async function isDuplicateEvent(
-  title: string, date: string | null, link: string | null, sourceUrl: string | null,
-  dedupHash: string, supabase: any
-): Promise<boolean> {
-  // 1) Exact hash
-  const { data: exactMatch } = await supabase
-    .from('events')
-    .select('id')
-    .eq('dedup_hash', dedupHash)
-    .maybeSingle();
-  if (exactMatch) return true;
+/**
+ * DedupIndex (v13) — the old isDuplicateEvent fired up to three Supabase
+ * queries PER CANDIDATE, one of them pulling 200 rows. With 50 candidates that
+ * was ~150 round-trips before a single event was written. The whole comparison
+ * set is now loaded once per run and matched in memory.
+ */
+class DedupIndex {
+  private hashes = new Set<string>();
+  private urls = new Set<string>();
+  private byDate = new Map<string, string[]>();
+  private undated: string[] = [];
 
-  // 2) Same normalized link (registration_link OR source_url)
-  const candidates = Array.from(new Set([normalizeUrl(link), normalizeUrl(sourceUrl)].filter(Boolean) as string[]));
-  for (const norm of candidates) {
-    const { data: linkMatches } = await supabase
+  static async load(supabase: any): Promise<DedupIndex> {
+    const idx = new DedupIndex();
+    const { data, error } = await supabase
       .from('events')
-      .select('id, registration_link, source_url')
-      .or(`registration_link.ilike.%${norm}%,source_url.ilike.%${norm}%`)
-      .limit(10);
-    if (linkMatches) {
-      for (const m of linkMatches) {
-        if (normalizeUrl(m.registration_link) === norm || normalizeUrl(m.source_url) === norm) return true;
-      }
+      .select('title, event_date, dedup_hash, registration_link, source_url')
+      .gte('event_date', new Date(Date.now() - 90 * 86400000).toISOString().split('T')[0])
+      .limit(5000);
+
+    // Undated rows are excluded by the date filter above, so pull them too.
+    const { data: undated } = await supabase
+      .from('events')
+      .select('title, event_date, dedup_hash, registration_link, source_url')
+      .is('event_date', null)
+      .limit(1000);
+
+    if (error) console.error('[dedup] preload failed:', error.message);
+    for (const row of [...(data || []), ...(undated || [])]) idx.add(row);
+    console.log(`[dedup] preloaded ${idx.size} existing events`);
+    return idx;
+  }
+
+  get size(): number {
+    return this.hashes.size + this.undated.length;
+  }
+
+  add(row: { title: string; event_date?: string | null; dedup_hash?: string | null; registration_link?: string | null; source_url?: string | null }) {
+    if (row.dedup_hash) this.hashes.add(row.dedup_hash);
+    for (const u of [row.registration_link, row.source_url]) {
+      const n = normalizeUrl(u);
+      if (n) this.urls.add(n);
+    }
+    if (row.event_date) {
+      const list = this.byDate.get(row.event_date) || [];
+      list.push(row.title);
+      this.byDate.set(row.event_date, list);
+    } else {
+      this.undated.push(row.title);
     }
   }
 
-  // 3) Fuzzy title match on same date
-  if (date) {
-    const { data: sameDateEvents } = await supabase
-      .from('events')
-      .select('id, title')
-      .eq('event_date', date)
-      .limit(50);
-    if (sameDateEvents) {
-      for (const ev of sameDateEvents) {
-        if (titleSimilarity(title, ev.title) > 0.7) return true;
-      }
+  isDuplicate(title: string, date: string | null, link: string | null, sourceUrl: string | null, dedupHash: string): boolean {
+    if (this.hashes.has(dedupHash)) return true;
+    for (const u of [link, sourceUrl]) {
+      const n = normalizeUrl(u);
+      if (n && this.urls.has(n)) return true;
     }
-  } else {
-    // 4) Cross-platform fallback (no date) — strict similarity threshold
-    const { data: noDateCandidates } = await supabase
-      .from('events')
-      .select('id, title')
-      .limit(200);
-    if (noDateCandidates) {
-      for (const ev of noDateCandidates) {
-        if (titleSimilarity(title, ev.title) > 0.85) return true;
+    if (date) {
+      for (const t of this.byDate.get(date) || []) {
+        if (titleSimilarity(title, t) > 0.7) return true;
       }
+      return false;
     }
+    for (const t of this.undated) {
+      if (titleSimilarity(title, t) > 0.85) return true;
+    }
+    return false;
   }
-
-  return false;
 }
 
 // ============ FIRECRAWL (enrichment only) ============
@@ -868,6 +891,55 @@ async function enrichLink(link: string, firecrawlApiKey: string): Promise<any | 
   }
 }
 
+/**
+ * Free enrichment: fetch the page ourselves and read its JSON-LD / OpenGraph.
+ * Tried BEFORE the paid provider on user submissions, since most event hosts
+ * (Luma, Eventbrite, Meetup, Partiful) ship schema.org Event markup server-side.
+ */
+async function enrichFromPage(link: string): Promise<any | null> {
+  try {
+    const resp = await fetch(link, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml',
+      },
+      signal: AbortSignal.timeout(12000),
+    });
+    if (!resp.ok) return null;
+    const html = await resp.text();
+
+    const ld = extractJsonLdEvent(html);
+    const ogTitle = html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i)?.[1] || null;
+    const ogDesc = html.match(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i)?.[1] || null;
+    const ogImage = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i)?.[1] || null;
+    const htmlTitle = html.match(/<title[^>]*>([^<]{5,200})<\/title>/i)?.[1]?.trim() || null;
+
+    const title = ld.title || ogTitle || htmlTitle;
+    if (!title || title.length < 5) return null;
+
+    return {
+      title,
+      description: ld.description || ogDesc || '',
+      source_url: link,
+      registration_link: link,
+      source_platform: 'community',
+      venue: ld.venue,
+      city: ld.city,
+      event_date: ld.event_date,
+      event_time: ld.event_time,
+      end_date: ld.end_date,
+      organizer: ld.organizer,
+      is_online: ld.is_online,
+      image_url: ogImage,
+      metadata: { event_date: ld.event_date },
+      trusted_metadata: !!ld.event_date,
+    };
+  } catch (e) {
+    console.warn('[enrichFromPage] failed:', e);
+    return null;
+  }
+}
+
 // ============ X/TWITTER DISCOVERY via Firecrawl search ============
 // Returns BOTH:
 //   - outboundLinks: lu.ma/eventbrite/meetup links found inside tweets (enrich → structured)
@@ -933,153 +1005,6 @@ async function discoverFromXTwitter(firecrawlApiKey: string): Promise<{
 }
 
 // ============ PLATFORM SCRAPERS ============
-
-// Luma's public REST search API (api.lu.ma/public/v2/event/search) returns 404 — deprecated.
-// New strategy: use Firecrawl `/search` to find real lu.ma event pages, then enrich each one.
-// Firecrawl pulls JSON-LD + metadata, which is far more reliable than HTML scraping.
-async function scrapeLumaEvents(firecrawlApiKey: string): Promise<any[]> {
-  const events: any[] = [];
-  if (!firecrawlApiKey) {
-    console.warn('[Luma] No Firecrawl key — skipping Luma discovery');
-    return events;
-  }
-
-  const queries = [
-    'site:lu.ma web3 nigeria',
-    'site:lu.ma blockchain lagos',
-    'site:lu.ma crypto africa OR abuja',
-    'site:lu.ma web3 lagos meetup OR hackathon',
-  ];
-
-  const seen = new Set<string>();
-  // v12: rate-limited, serialized searches (parallel calls tripped Firecrawl's 429).
-  const searchResults: any[] = [];
-  for (const query of queries) {
-    searchResults.push(await fcRequest('/search', { query, limit: 8 }, firecrawlApiKey));
-  }
-  for (const data of searchResults) {
-    if (!data) continue;
-    const results = data.data || [];
-    for (const r of results) {
-      const url: string = r.url || r.metadata?.sourceURL || '';
-      if (!/^https?:\/\/lu\.ma\/(e\/)?[A-Za-z0-9_-]{3,}$/i.test(url)) continue;
-      if (seen.has(url)) continue;
-      seen.add(url);
-      const title: string = r.title || r.metadata?.title || '';
-      const description: string = r.description || r.metadata?.description || '';
-      if (!title || title.length < 5) continue;
-      events.push({
-        title, description,
-        event_date: null, event_time: null, end_date: null,
-        venue: null, city: null,
-        registration_link: url, source_url: url,
-        source_platform: 'luma', is_online: false, organizer: null,
-      });
-    }
-  }
-  console.log(`[Luma] Discovered ${events.length} candidate event pages`);
-  return events;
-}
-
-async function scrapeEventbriteEvents(): Promise<any[]> {
-  const events: any[] = [];
-  const queries = ["web3", "blockchain", "crypto", "defi", "nft", "web3-africa", "blockchain-lagos"];
-
-  for (const query of queries) {
-    try {
-      const url = `https://www.eventbrite.com/d/nigeria/${query}/`;
-      const resp = await fetch(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml',
-        }
-      });
-
-      if (!resp.ok) continue;
-
-      const html = await resp.text();
-      const jsonLdMatches = html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g);
-      for (const m of jsonLdMatches) {
-        try {
-          const ld = JSON.parse(m[1]);
-          const items = Array.isArray(ld) ? ld : [ld];
-          for (const item of items) {
-            if (item['@type'] === 'Event') {
-              events.push({
-                title: item.name || "",
-                description: (item.description || "").substring(0, 500),
-                event_date: item.startDate ? new Date(item.startDate).toISOString().split('T')[0] : null,
-                event_time: item.startDate ? new Date(item.startDate).toTimeString().split(' ')[0] : null,
-                end_date: item.endDate ? new Date(item.endDate).toISOString().split('T')[0] : null,
-                venue: item.location?.name || null,
-                city: item.location?.address?.addressLocality || null,
-                registration_link: item.url || null,
-                source_url: item.url || null,
-                source_platform: "eventbrite",
-                is_online: item.location?.['@type'] === 'VirtualLocation',
-                organizer: item.organizer?.name || null,
-              });
-            }
-          }
-        } catch { /* skip */ }
-      }
-    } catch (e) {
-      console.error(`[Eventbrite] Error for "${query}":`, e);
-    }
-  }
-  return events;
-}
-
-async function scrapeMeetupEvents(): Promise<any[]> {
-  const events: any[] = [];
-  const urls = [
-    'https://www.meetup.com/find/?keywords=web3+blockchain+crypto&location=ng--Lagos',
-    'https://www.meetup.com/find/?keywords=web3&location=ng--Abuja',
-    'https://www.meetup.com/find/?keywords=blockchain+crypto&location=ng--Lagos',
-  ];
-
-  for (const url of urls) {
-    try {
-      const resp = await fetch(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Accept': 'text/html',
-        }
-      });
-
-      if (!resp.ok) continue;
-
-      const html = await resp.text();
-      const jsonLdMatches = html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g);
-      for (const m of jsonLdMatches) {
-        try {
-          const ld = JSON.parse(m[1]);
-          const items = Array.isArray(ld) ? ld : [ld];
-          for (const item of items) {
-            if (item['@type'] === 'Event') {
-              events.push({
-                title: item.name || "",
-                description: (item.description || "").substring(0, 500),
-                event_date: item.startDate ? new Date(item.startDate).toISOString().split('T')[0] : null,
-                event_time: item.startDate ? new Date(item.startDate).toTimeString().split(' ')[0] : null,
-                venue: item.location?.name || null,
-                city: item.location?.address?.addressLocality || null,
-                registration_link: item.url || null,
-                source_url: item.url || null,
-                source_platform: "meetup",
-                is_online: item.location?.['@type'] === 'VirtualLocation',
-                organizer: item.organizer?.name || null,
-              });
-            }
-          }
-        } catch { /* skip */ }
-      }
-    } catch (e) {
-      console.error('[Meetup] Error:', e);
-    }
-  }
-  return events;
-}
 
 // ============ HYBRID FILTER PIPELINE (v7) ============
 
@@ -1306,78 +1231,13 @@ async function maybeSendYieldAlerts(supabase: any): Promise<void> {
   }
 }
 
-// Nitter: free X mirror with RSS. Try a rotating set of instances; first one
-// that responds wins. Returns tweet-shaped candidates compatible with the
-// existing discovery pipeline.
-const NITTER_INSTANCES = [
-  'nitter.privacydev.net',
-  'nitter.poast.org',
-  'xcancel.com',
-  'nitter.net',
-];
-
-async function scrapeNitter(queries: string[]): Promise<any[]> {
-  const tweets: any[] = [];
-  for (const query of queries) {
-    let xml: string | null = null;
-    let used = '';
-    for (const inst of NITTER_INSTANCES) {
-      try {
-        const url = `https://${inst}/search/rss?f=tweets&q=${encodeURIComponent(query)}`;
-        const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
-        if (r.ok) {
-          const body = await r.text();
-          // v12: xcancel and friends answer with a 200 "RSS reader not yet
-          // whitelisted!" feed. That is a failure, not 5 events — skip it,
-          // otherwise the pipeline burns AI budget on garbage.
-          if (/not\s+yet\s+whitelisted|rate\s*limit|instance\s+has\s+been\s+blocked/i.test(body)) {
-            console.warn(`[Nitter] ${inst} rejected our reader for "${query}"`);
-            continue;
-          }
-          if (body.includes('<item>') || body.includes('<item ')) {
-            xml = body; used = inst; break;
-          }
-        }
-      } catch { /* try next instance */ }
-    }
-    if (!xml) { console.warn(`[Nitter] all instances failed for "${query}"`); continue; }
-    console.log(`[Nitter] hit ${used} for "${query}"`);
-
-    // Minimal RSS parse — pull <item> blocks then extract title/link/description
-    const items = xml.match(/<item[\s\S]*?<\/item>/g) || [];
-    for (const item of items.slice(0, 6)) {
-      const grab = (tag: string) => {
-        const m = item.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`));
-        if (!m) return '';
-        return m[1].replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').trim();
-      };
-      const title = grab('title').replace(/<[^>]+>/g, '');
-      const link = grab('link');
-      const desc = grab('description').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-      if (!title || title.length < 10 || !link) continue;
-      const xUrl = link.replace(/^https?:\/\/[^/]+/, 'https://x.com');
-      tweets.push({
-        title: title.substring(0, 240),
-        description: (desc || title).substring(0, 1500),
-        source_url: xUrl,
-        registration_link: xUrl,
-        source_platform: 'nitter',
-        venue: null, city: null, event_date: null, event_time: null, end_date: null, organizer: null,
-        is_online: /twitter\s+space|x\s+space|virtual|online|zoom/i.test(desc + ' ' + title),
-      });
-    }
-  }
-  return tweets;
-}
-
-
-
 async function processEvent(
   raw: any,
   sourceName: string,
   supabase: any,
   lovableApiKey: string,
   stats: any,
+  dedup: DedupIndex,
   options: { upgradeId?: string } = {}
 ): Promise<boolean> {
   const upgradeId = options.upgradeId;
@@ -1467,7 +1327,31 @@ async function processEvent(
     }
   }
 
-  // STAGE 3: AI classification
+  // STAGE 3: AI classification.
+  // v13 FAST PATH — a Luma/Meetup/JSON-LD record already carries a machine-read
+  // date, location and registration link. Sending it to the model added ~1.5s
+  // and a token cost to re-confirm facts we already hold, so trusted structured
+  // records skip the round-trip entirely. Discovery (tweets) always goes to AI.
+  const trusted = raw.trusted_metadata === true && ev.source_type === 'structured';
+  if (trusted && kwScore >= 2 && ev.event_date && !isPastDate(ev.event_date)) {
+    stats.fast_path = (stats.fast_path || 0) + 1;
+    return await persistEvent(ev, {
+      is_event: true,
+      is_listicle: false,
+      event_type: detectEventType(fullText),
+      has_real_date: true,
+      has_location: !!(ev.venue || ev.city || ev.is_online),
+      has_registration: !!(ev.registration_link || ev.source_url),
+      is_online: ev.is_online,
+      confidence: 0.92,
+      reason: 'trusted structured metadata (fast path)',
+      event_date: ev.event_date,
+      state: null,
+      city: ev.city,
+      tags: [],
+    }, raw, sourceName, supabase, stats, dedup, fullText, upgradeId);
+  }
+
   if (!lovableApiKey) {
     stats.filtered_ai++;
     bumpGate(stats, 'ai_unavailable');
@@ -1503,6 +1387,21 @@ async function processEvent(
   const acceptTag = ev.source_type === "discovery" ? "AI ACCEPT DISCOVERY" : "ACCEPT";
   console.log(`[${acceptTag}] "${ev.title}" confidence=${aiResult.confidence} reason="${aiResult.reason}"`);
 
+  return await persistEvent(ev, aiResult, raw, sourceName, supabase, stats, dedup, fullText, upgradeId);
+}
+
+/** Shared write path for both the AI-validated and the fast-path routes. */
+async function persistEvent(
+  ev: NormalizedEvent,
+  aiResult: AIClassification,
+  raw: any,
+  sourceName: string,
+  supabase: any,
+  stats: any,
+  dedup: DedupIndex,
+  fullText: string,
+  upgradeId?: string,
+): Promise<boolean> {
   // Build final record
   const eventDate = aiResult.event_date || ev.event_date;
   const isOnline = aiResult.is_online || ev.is_online;
@@ -1514,16 +1413,15 @@ async function processEvent(
   const confidenceScore = aiResult.confidence;
   const dedupHash = await generateDedupHash(ev.title, eventDate, resolvedState);
 
-  // STAGE 5: Dedup (skip when upgrading a placeholder — placeholder IS the row)
+  // STAGE 5: Dedup — in-memory index, no per-candidate round-trips
   if (!upgradeId) {
-    const isDupe = await isDuplicateEvent(ev.title, eventDate, ev.registration_link, ev.source_url, dedupHash, supabase);
-    if (isDupe) {
+    if (dedup.isDuplicate(ev.title, eventDate, ev.registration_link, ev.source_url, dedupHash)) {
       stats.duplicates++;
       return false;
     }
   }
 
-  const submissionCount = ev._submission_count || 0;
+  const submissionCount = ev._submission_count || raw?._submission_count || 0;
   const popularityScore = (submissionCount * 0.4) + (confidenceScore * 0.6);
 
   const payload = {
@@ -1552,7 +1450,7 @@ async function processEvent(
 
   const { error } = upgradeId
     ? await supabase.from('events').update(payload).eq('id', upgradeId)
-    : await supabase.from('events').insert({ ...payload, image_url: null, posted_to_telegram: false });
+    : await supabase.from('events').insert({ ...payload, image_url: raw?.image_url || null, posted_to_telegram: false });
 
   if (error) {
     console.error('Persist error:', error.message);
@@ -1560,14 +1458,42 @@ async function processEvent(
     return false;
   }
 
+  dedup.add({ title: ev.title, event_date: eventDate, dedup_hash: dedupHash, registration_link: ev.registration_link, source_url: ev.source_url });
   stats.inserted++;
   console.log(`${upgradeId ? 'UPGRADED' : 'INSERTED'}: "${ev.title}" [${eventType}] confidence=${confidenceScore}`);
   return true;
 }
 
+// ============ CONCURRENCY ============
+
+/**
+ * Bounded parallel map. v12 processed candidates strictly one at a time, so a
+ * 40-candidate run serialised 40 AI round-trips (~90s). Eight at a time keeps
+ * the model gateway happy and cuts wall-clock by roughly an order of magnitude.
+ */
+async function pooled<T>(items: T[], limit: number, worker: (item: T) => Promise<void>): Promise<void> {
+  let cursor = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const i = cursor++;
+      if (i >= items.length) return;
+      try {
+        await worker(items[i]);
+      } catch (e) {
+        console.error('[pool] worker error:', e);
+      }
+    }
+  });
+  await Promise.all(runners);
+}
+
 // ============ MAIN HANDLER ============
 
+const MAX_CANDIDATES_PER_RUN = 120;
+const AI_CONCURRENCY = 8;
+
 Deno.serve(async () => {
+  const startedAt = Date.now();
   try {
     const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
     const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
@@ -1575,178 +1501,129 @@ Deno.serve(async () => {
     const firecrawlApiKey = Deno.env.get('FIRECRAWL_API_KEY') || '';
     const supabase = createClient(supabaseUrl, supabaseKey);
 
-    // v11 — load auto-tuned thresholds before any AI gating runs
-    await loadThresholds(supabase);
-
-    const emptyStats = () => ({ found: 0, inserted: 0, duplicates: 0, filtered_keyword: 0, filtered_ai: 0, filtered_gate: 0, errors: '' });
-    const results: Record<string, any> = {
-      luma: emptyStats(),
-      eventbrite: emptyStats(),
-      meetup: emptyStats(),
-      x: emptyStats(),                // tweet-native (discovery mode)
-      x_discovery: emptyStats(),      // outbound links enriched (structured mode)
-      nitter: emptyStats(),           // v11 — Nitter fallback for X
-    };
-
-    // ---- Phase 1: Scrape structured platforms in parallel ----
-    const [lumaEvents, eventbriteEvents, meetupEvents] = await Promise.all([
-      scrapeLumaEvents(firecrawlApiKey).catch(e => { results.luma.errors = String(e); return []; }),
-      scrapeEventbriteEvents().catch(e => { results.eventbrite.errors = String(e); return []; }),
-      scrapeMeetupEvents().catch(e => { results.meetup.errors = String(e); return []; }),
+    // Thresholds and the dedup comparison set load once, in parallel.
+    const [, dedup] = await Promise.all([
+      loadThresholds(supabase),
+      DedupIndex.load(supabase),
     ]);
 
-    results.luma.found = lumaEvents.length;
-    results.eventbrite.found = eventbriteEvents.length;
-    results.meetup.found = meetupEvents.length;
+    const emptyStats = () => ({ found: 0, inserted: 0, duplicates: 0, filtered_keyword: 0, filtered_ai: 0, filtered_gate: 0, fast_path: 0, errors: '' });
+    const results: Record<string, any> = {
+      luma: emptyStats(),
+      meetup: emptyStats(),
+      community: emptyStats(),
+      eventbrite: emptyStats(),
+      x: emptyStats(),
+      x_discovery: emptyStats(),
+      nitter: emptyStats(),
+    };
 
-    // Enrich Luma candidates in PARALLEL (date/venue live in JSON-LD)
-    const enrichedLuma: any[] = [];
-    if (firecrawlApiKey && lumaEvents.length > 0) {
-      const slice = lumaEvents.slice(0, 8);
-      const enrichedAll = await Promise.all(
-        slice.map(lev => enrichLink(lev.source_url, firecrawlApiKey).catch(() => null))
-      );
-      for (let i = 0; i < slice.length; i++) {
-        const enriched = enrichedAll[i];
-        if (enriched) {
-          enriched.source_platform = "luma";
-          enriched.title = enriched.title || slice[i].title;
-          enrichedLuma.push(enriched);
-        } else {
-          enrichedLuma.push(slice[i]);
-        }
-      }
-    }
+    // ---- Phase 1: free sources, all in parallel, no API key required ----
+    // v13: the pipeline no longer depends on a paid scraping provider. Firecrawl
+    // is enrichment only, so a 402 degrades one lane instead of the whole run.
+    const nitterQueries = [
+      'web3 lagos OR nigeria',
+      'blockchain meetup nigeria',
+      'crypto AMA africa',
+      '"twitter space" web3 nigeria',
+      '"join us" web3 lagos',
+    ];
 
-    // ---- Phase 1b: X/Twitter discovery (DUAL OUTPUT) ----
+    const [luma, meetup, community, nitter] = await Promise.all([
+      fetchLumaCityEvents().catch(e => { results.luma.errors = String(e); return [] as RawCandidate[]; }),
+      fetchMeetupEvents().catch(e => { results.meetup.errors = String(e); return [] as RawCandidate[]; }),
+      fetchCommunityCalendars().catch(e => { results.community.errors = String(e); return [] as RawCandidate[]; }),
+      fetchNitter(nitterQueries).catch(e => { results.nitter.errors = String(e); return [] as RawCandidate[]; }),
+    ]);
+
+    results.luma.found = luma.length;
+    results.meetup.found = meetup.length;
+    results.community.found = community.length;
+    results.nitter.found = nitter.length;
+
+    // ---- Phase 1b: Firecrawl lane (optional) ----
     let xDiscoveredEvents: any[] = [];
     let xTweetEvents: any[] = [];
     if (firecrawlApiKey) {
       try {
         const { outboundLinks, tweetEvents } = await discoverFromXTwitter(firecrawlApiKey);
-        console.log(`[X Discovery] outbound=${outboundLinks.length} tweetEvents=${tweetEvents.length}`);
         results.x_discovery.found = outboundLinks.length;
         results.x.found = tweetEvents.length;
+        xTweetEvents = tweetEvents;
 
-        // Enrich top 5 tweets in PARALLEL
-        const topTweets = tweetEvents.slice(0, 5);
-        const enrichedTweets = await Promise.all(
-          topTweets.map(t => enrichLink(t.source_url, firecrawlApiKey).catch(() => null))
-        );
-        for (let i = 0; i < topTweets.length; i++) {
-          const en = enrichedTweets[i];
-          if (en && en.description && en.description.length > topTweets[i].description.length) {
-            xTweetEvents.push({ ...topTweets[i], description: en.description, title: topTweets[i].title || en.title });
-          } else {
-            xTweetEvents.push(topTweets[i]);
-          }
-        }
-        xTweetEvents.push(...tweetEvents.slice(5));
-
-        // Enrich outbound links in PARALLEL (top 5)
-        const outSlice = outboundLinks.slice(0, 5);
-        const enrichedOut = await Promise.all(
-          outSlice.map(l => enrichLink(l, firecrawlApiKey).catch(() => null))
-        );
-        for (const en of enrichedOut) {
+        // Enrich a small slice of outbound links; each call is rate-limited and
+        // short-circuits the moment the provider reports no credit.
+        for (const link of outboundLinks.slice(0, 5)) {
+          if (fcState.outOfCredits) break;
+          const en = await enrichLink(link, firecrawlApiKey).catch(() => null);
           if (en) {
-            en.source_platform = "x_discovery";
+            en.source_platform = 'x_discovery';
             xDiscoveredEvents.push(en);
           }
         }
       } catch (e) {
         results.x_discovery.errors = String(e);
       }
+    } else {
+      console.log('[Firecrawl] no key configured — running on free sources only');
     }
 
-    // ---- Phase 1c: Nitter fallback (when X via Firecrawl returns nothing) ----
-    let nitterEvents: any[] = [];
-    if (xTweetEvents.length === 0) {
-      try {
-        const nitterQueries = [
-          'web3 lagos OR nigeria',
-          'blockchain meetup nigeria',
-          'crypto AMA africa',
-          '"twitter space" web3 nigeria',
-          '"join us" web3 lagos',
-        ];
-        nitterEvents = await scrapeNitter(nitterQueries);
-        results.nitter.found = nitterEvents.length;
-        console.log(`[Nitter] fallback found ${nitterEvents.length} candidates`);
-      } catch (e) {
-        results.nitter.errors = String(e);
-        console.error('[Nitter] failed:', e);
-      }
-    }
-
-    // ---- Phase 2: Process all events through pipeline ----
+    // ---- Phase 2: single candidate stream ----
     const allRaw = [
-      ...enrichedLuma.map(e => ({ ...e, _source: 'luma' as const })),
-      ...eventbriteEvents.map(e => ({ ...e, _source: 'eventbrite' as const })),
-      ...meetupEvents.map(e => ({ ...e, _source: 'meetup' as const })),
-      ...xDiscoveredEvents.map(e => ({ ...e, _source: 'x_discovery' as const })),
-      ...xTweetEvents.map(e => ({ ...e, _source: 'x' as const })),
-      ...nitterEvents.map(e => ({ ...e, _source: 'nitter' as const })),
-    ];
+      ...luma.map(e => ({ ...e, _source: 'luma' })),
+      ...meetup.map(e => ({ ...e, _source: 'meetup' })),
+      ...community.map(e => ({ ...e, _source: 'community' })),
+      ...xDiscoveredEvents.map(e => ({ ...e, _source: 'x_discovery' })),
+      ...xTweetEvents.map(e => ({ ...e, _source: 'x' })),
+      ...nitter.map(e => ({ ...e, _source: 'nitter' })),
+    ].slice(0, MAX_CANDIDATES_PER_RUN);
 
-    console.log(`Total raw candidates: ${allRaw.length} (max 50 will be processed)`);
-
-    // Source breakdown logging
     const sourceBreakdown: Record<string, number> = {};
     for (const r of allRaw) sourceBreakdown[r._source] = (sourceBreakdown[r._source] || 0) + 1;
-    console.log(`[BREAKDOWN raw] ${JSON.stringify(sourceBreakdown)}`);
+    console.log(`[BREAKDOWN raw] ${JSON.stringify(sourceBreakdown)} total=${allRaw.length}`);
 
-    let processed = 0;
-    for (const raw of allRaw) {
-      if (processed >= 50) break; // Cap per run
-      try {
-        await processEvent(raw, raw._source, supabase, lovableApiKey, results[raw._source]);
-        processed++;
-      } catch (e) {
-        console.error('Process event error:', e);
-        results[raw._source].errors += String(e) + '; ';
-      }
-    }
+    // Structured, trusted records first: they take the fast path and seed the
+    // dedup index before the noisier discovery candidates are judged.
+    allRaw.sort((a: any, b: any) => (b.trusted_metadata ? 1 : 0) - (a.trusted_metadata ? 1 : 0));
 
-    // Log scrape results (with per-gate rejection breakdown)
-    for (const [source, stats] of Object.entries(results) as [string, any][]) {
-      await supabase.from('scrape_logs').insert({
-        source,
-        events_found: stats.found,
-        events_inserted: stats.inserted,
-        duplicates_skipped: stats.duplicates,
-        errors: (stats.errors || '') + (fcState.outOfCredits ? ` ${fcState.lastError}` : '') || null,
-        gate_rejections: stats.gate_rejections || {},
-      });
-    }
+    await pooled(allRaw, AI_CONCURRENCY, async (raw: any) => {
+      const bucket = results[raw._source] ?? (results[raw._source] = emptyStats());
+      await processEvent(raw, raw._source, supabase, lovableApiKey, bucket, dedup);
+    });
 
-    // v12 — when the scraping provider is out of credits, a zero-yield run says
-    // nothing about our gates. Record it loudly and skip auto-tuning so
-    // thresholds don't drift on meaningless data.
+    // ---- Phase 3: logs, tuning, housekeeping (parallel) ----
+    const logRows = Object.entries(results).map(([source, stats]: [string, any]) => ({
+      source,
+      events_found: stats.found,
+      events_inserted: stats.inserted,
+      duplicates_skipped: stats.duplicates,
+      errors: (stats.errors || '') + (fcState.outOfCredits ? ` ${fcState.lastError}` : '') || null,
+      gate_rejections: stats.gate_rejections || {},
+    }));
+
+    await Promise.all([
+      supabase.from('scrape_logs').insert(logRows),
+      // Mark past events completed
+      supabase
+        .from('events')
+        .update({ status: 'completed' })
+        .lt('event_date', new Date().toISOString().split('T')[0])
+        .eq('status', 'upcoming'),
+    ]);
+
     if (fcState.outOfCredits) {
-      console.error('[v12] PROVIDER BLOCKED:', fcState.lastError);
+      console.warn('[v13] Firecrawl lane blocked:', fcState.lastError);
       await supabase.from('pipeline_alerts').upsert({
         source: 'firecrawl',
         last_alert_at: new Date().toISOString(),
         reason: 'provider_out_of_credits',
-        payload: { message: fcState.lastError },
+        payload: { message: fcState.lastError, note: 'free sources unaffected' },
       });
-    } else {
-      // v11 — after logs are persisted, run self-tuning + dispatch yield alerts
-      await autoTuneThresholds(supabase);
-      await maybeSendYieldAlerts(supabase);
     }
+    await autoTuneThresholds(supabase);
+    await maybeSendYieldAlerts(supabase);
 
-
-
-    // Mark past events as completed
-    await supabase
-      .from('events')
-      .update({ status: 'completed' })
-      .lt('event_date', new Date().toISOString().split('T')[0])
-      .eq('status', 'upcoming');
-
-    // ---- Process user submissions with enrichment ----
+    // ---- Phase 4: user submissions ----
     const { data: submissions } = await supabase
       .from('user_submitted_events')
       .select('*')
@@ -1754,9 +1631,8 @@ Deno.serve(async () => {
       .limit(10);
 
     let submissionsProcessed = 0, submissionsAccepted = 0;
-    if (submissions && submissions.length > 0 && firecrawlApiKey) {
-      for (const sub of submissions) {
-        // Find any pending_review placeholder created by /submit for this link
+    if (submissions && submissions.length > 0) {
+      await pooled(submissions, 4, async (sub: any) => {
         let upgradeId: string | undefined;
         if (sub.link) {
           const { data: placeholder } = await supabase
@@ -1768,50 +1644,50 @@ Deno.serve(async () => {
           upgradeId = placeholder?.id;
         }
 
-        let enrichedEvent: any = null;
+        // Free path first: read the page ourselves and parse its JSON-LD.
+        // Only fall back to the paid provider when that comes up empty.
+        let enriched: any = null;
         if (sub.link) {
-          enrichedEvent = await enrichLink(sub.link, firecrawlApiKey);
+          enriched = await enrichFromPage(sub.link).catch(() => null);
+          if (!enriched && firecrawlApiKey && !fcState.outOfCredits) {
+            enriched = await enrichLink(sub.link, firecrawlApiKey).catch(() => null);
+          }
         }
 
-        if (enrichedEvent) {
-          enrichedEvent._submission_count = sub.submission_count;
+        if (enriched) {
+          enriched._submission_count = sub.submission_count;
           const subStats = emptyStats();
-          const accepted = await processEvent(enrichedEvent, 'community', supabase, lovableApiKey, subStats, { upgradeId });
+          const accepted = await processEvent(enriched, 'community', supabase, lovableApiKey, subStats, dedup, { upgradeId });
           if (accepted) submissionsAccepted++;
         } else if (upgradeId) {
-          // Could not enrich — mark placeholder rejected so it doesn't sit forever
           await supabase.from('events')
             .update({ status: 'rejected', description: 'Unable to fetch event page for validation.' })
             .eq('id', upgradeId);
         }
 
-        await supabase.from('user_submitted_events')
-          .update({ processed: true })
-          .eq('id', sub.id);
+        await supabase.from('user_submitted_events').update({ processed: true }).eq('id', sub.id);
         submissionsProcessed++;
-      }
+      });
     }
 
-    // FAILSAFE
     const totalInserted = Object.values(results).reduce((s: number, r: any) => s + r.inserted, 0);
     const totalFound = Object.values(results).reduce((s: number, r: any) => s + r.found, 0);
+    const fastPath = Object.values(results).reduce((s: number, r: any) => s + (r.fast_path || 0), 0);
+    const elapsedMs = Date.now() - startedAt;
 
-    if (totalInserted === 0 && totalFound === 0) {
-      console.log('FAILSAFE: No events found anywhere.');
-    }
-
-    console.log(`Pipeline complete. Found=${totalFound}, Inserted=${totalInserted}`);
+    console.log(`Pipeline complete in ${elapsedMs}ms. Found=${totalFound}, Inserted=${totalInserted}, fastPath=${fastPath}`);
 
     return new Response(JSON.stringify({
       ok: true,
-      provider_blocked: fcState.outOfCredits ? fcState.lastError : null,
+      version: 'v13',
+      elapsed_ms: elapsedMs,
+      firecrawl: firecrawlApiKey ? (fcState.outOfCredits ? 'blocked (free sources unaffected)' : 'active') : 'not configured',
       scrape_results: results,
       submissions: { processed: submissionsProcessed, accepted: submissionsAccepted },
       total_found: totalFound,
       total_inserted: totalInserted,
-    }), {
-      headers: { 'Content-Type': 'application/json' },
-    });
+      ai_calls_skipped: fastPath,
+    }), { headers: { 'Content-Type': 'application/json' } });
   } catch (e) {
     console.error('Pipeline error:', e);
     return new Response(JSON.stringify({ error: String(e) }), {

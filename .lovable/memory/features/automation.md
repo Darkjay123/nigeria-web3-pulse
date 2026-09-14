@@ -1,22 +1,40 @@
 ---
-name: Automation pipeline v12 — Firecrawl rate limiting, provider-block detection, Nitter hardening
-description: v12 fixes the syntax error that blocked v11 deploys, serializes all Firecrawl calls behind a 14 req/min queue, detects HTTP 402 credit exhaustion, treats nitter as a discovery source, and rejects fake "not whitelisted" RSS feeds
+name: Automation pipeline v13 — free-first sources, parallel processing, in-memory dedup
+description: v13 removes the hard Firecrawl dependency (the 402 that emptied the pipeline), adds keyless Luma/Meetup/JSON-LD sources, processes candidates 8-wide, skips the AI round-trip for trusted structured metadata, and replaces per-candidate dedup queries with a single preloaded index
 type: feature
 ---
-## Pipeline (v12)
+## Pipeline (v13)
 ```
-Scrape (rate-limited Firecrawl queue) → Normalize → cleanDisplayTitle → title gate → Page Type Gate (structured|discovery) → Web3 keyword → [DISCOVERY: intent + score≥2 + past-meta-date] → AI → Final Validator (per-source threshold from pipeline_config) → Dedup → Insert
+Free sources (Luma city pages · Meetup search · JSON-LD calendars · Nitter) [parallel]
+  + optional Firecrawl lane (X discovery, enrichment)
+→ Normalize → cleanDisplayTitle → title gate → Page Type Gate → Web3 keyword
+→ [trusted structured metadata? → FAST PATH, no AI]
+→ [DISCOVERY: intent + score>=2] → AI → Final Validator → in-memory Dedup → Insert
 ```
 
-## v12 Changes
-- **Deploy blocker fixed** — `scrape_logs` insert block was missing `});`, so the whole v11 feature set (auto-tune, Nitter, telemetry) never shipped.
-- **Firecrawl rate limiter** — `fcRequest(path, body, key)` serializes ALL Firecrawl traffic with a 4.3s gap (~14 req/min) plus one 429 backoff retry. Parallel fan-out previously 429'd every call, so every source reported `found=0`. Query counts trimmed (Luma 4, X 4) to fit the budget; X no longer does two searches per query.
-- **Provider-block detection** — HTTP 402 sets `fcState.outOfCredits`, aborts remaining scraping, writes a `pipeline_alerts` row (`reason='provider_out_of_credits'`), returns `provider_blocked` in the response, and SKIPS auto-tuning so thresholds don't drift on meaningless zero-yield runs.
-- **`nitter` is a discovery platform** — was classified structured, so every candidate died as `page_type:blocked domain` (x.com).
-- **Nitter guard** — instances (xcancel etc.) answer HTTP 200 with "RSS reader not yet whitelisted!"; that body is now treated as a failure instead of 5 fake events.
+## v13 changes
+- **Firecrawl is no longer load-bearing.** v12 routed every source through it, so
+  HTTP 402 meant zero events from every source. Sources now come from public
+  endpoints with no key: lu.ma city pages (`__NEXT_DATA__`), Meetup search
+  (`__NEXT_DATA__` Apollo cache), and any site publishing schema.org Event JSON-LD.
+  Firecrawl runs the X lane and enrichment only; a 402 degrades one lane.
+- **Dead scrapers replaced.** `scrapeEventbriteEvents` (HTTP 405 on the `/d/` path)
+  and `scrapeMeetupEvents` (JSON-LD no longer on the find page) both returned 0.
+- **Parallel processing.** Candidates run 8-wide through a bounded pool instead of
+  strictly one at a time; cap raised from 50 to 120 per run.
+- **Fast path.** Luma/Meetup/JSON-LD records already carry a machine-read date,
+  location and link, so they skip the model round-trip. Discovery still goes to AI.
+- **Dedup is in memory.** `isDuplicateEvent` fired up to 3 queries per candidate
+  (one pulling 200 rows). The comparison set is now loaded once per run.
+- **Free enrichment first** on user submissions: fetch the page and read its
+  JSON-LD/OG tags, and fall back to Firecrawl only when that comes up empty.
 
-## Known external constraint
-Firecrawl credits are exhausted (HTTP 402). No source can yield events until the plan is topped up — code-side gates are not the current bottleneck.
+## Frontend (v13)
+- TanStack Query provider in `__root.tsx`; feed and stats cached per filter set.
+- Filtering, sorting and limits run in Postgres (`useEvents`), not over a full
+  table download in the browser. Only the columns the cards render are selected.
+- `/` and `/events` share one `EventFeed`; `StatsBar` reads count queries.
 
 ## Untouched
-v9 intent/signal gates · v10 title hygiene + gate telemetry · v11 pipeline_config auto-tune + yield alerts · Dedup logic · placeholder upgrade flow.
+v9 intent/signal gates · v10 title hygiene + gate telemetry · v11 pipeline_config
+auto-tune + yield alerts · placeholder upgrade flow · UI design.
