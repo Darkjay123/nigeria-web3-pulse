@@ -1,0 +1,52 @@
+name: Harvest X for NG web3 events
+
+on:
+  schedule:
+    # 07:00 and 19:00 WAT (06:00 / 18:00 UTC)
+    - cron: "0 6,18 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Find candidates but write nothing"
+        type: boolean
+        default: false
+
+concurrency:
+  group: x-harvest
+  cancel-in-progress: false
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Agent Reach and the X backend
+        run: |
+          python -m pip install --upgrade pip pipx
+          # PyPI ships a trimmed build; the twitter/reddit/exa channels only
+          # exist on main, so install from the repo.
+          pip install "git+https://github.com/Panniantong/Agent-Reach.git@main"
+          pipx install twitter-cli || pip install twitter-cli || true
+
+      - name: Diagnose channels
+        continue-on-error: true
+        env:
+          TWITTER_AUTH_TOKEN: ${{ secrets.TWITTER_AUTH_TOKEN }}
+          TWITTER_CT0: ${{ secrets.TWITTER_CT0 }}
+        run: python -m agent_reach.cli doctor || true
+
+      - name: Harvest
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TWITTER_AUTH_TOKEN: ${{ secrets.TWITTER_AUTH_TOKEN }}
+          TWITTER_CT0: ${{ secrets.TWITTER_CT0 }}
+          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+        run: |
+          python workers/x-harvest/harvest.py ${{ inputs.dry_run && '--dry-run' || '' }}
