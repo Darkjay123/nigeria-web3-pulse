@@ -1,16 +1,14 @@
 import { Radar, CalendarDays, MapPin, Wifi } from "lucide-react";
-import type { Event } from "@/lib/types";
+import { useEventStats } from "@/hooks/use-events";
 
-export function StatsBar({ events }: { events: Event[] }) {
-  const upcoming = events.filter((e) => e.status === "upcoming").length;
-  const states = new Set(events.map((e) => e.state)).size;
-  const online = events.filter((e) => e.is_online).length;
+export function StatsBar() {
+  const { data } = useEventStats();
 
   const stats = [
-    { icon: Radar, label: "Total Events", value: events.length, color: "text-primary" },
-    { icon: CalendarDays, label: "Upcoming", value: upcoming, color: "text-radar-cyan" },
-    { icon: MapPin, label: "States", value: states, color: "text-chart-4" },
-    { icon: Wifi, label: "Online", value: online, color: "text-chart-5" },
+    { icon: Radar, label: "Total Events", value: data?.total, color: "text-primary" },
+    { icon: CalendarDays, label: "Upcoming", value: data?.upcoming, color: "text-radar-cyan" },
+    { icon: MapPin, label: "States", value: data?.states, color: "text-chart-4" },
+    { icon: Wifi, label: "Online", value: data?.online, color: "text-chart-5" },
   ];
 
   return (
@@ -22,7 +20,9 @@ export function StatsBar({ events }: { events: Event[] }) {
               <s.icon className="h-5 w-5" />
             </div>
             <div>
-              <p className="text-2xl font-bold font-heading text-foreground">{s.value}</p>
+              <p className="text-2xl font-bold font-heading text-foreground">
+                {s.value ?? "—"}
+              </p>
               <p className="text-xs text-muted-foreground">{s.label}</p>
             </div>
           </div>

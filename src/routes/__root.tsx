@@ -1,4 +1,6 @@
 import { Outlet, Link, createRootRoute, HeadContent, Scripts } from "@tanstack/react-router";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { useState } from "react";
 import { Toaster } from "sonner";
 import { Navbar } from "@/components/Navbar";
 
@@ -43,6 +45,7 @@ export const Route = createRootRoute({
     ],
     links: [
       { rel: "preconnect", href: "https://fonts.googleapis.com" },
+      { rel: "preconnect", href: "https://ttxlwhsgmqxknfhozwmg.supabase.co", crossOrigin: "anonymous" },
       { rel: "preconnect", href: "https://fonts.gstatic.com", crossOrigin: "anonymous" },
       {
         rel: "stylesheet",
@@ -74,11 +77,22 @@ function RootShell({ children }: { children: React.ReactNode }) {
 }
 
 function RootComponent() {
+  // One client per browser session; queries are cached across route changes so
+  // navigating between / and /events no longer refetches the whole feed.
+  const [queryClient] = useState(
+    () =>
+      new QueryClient({
+        defaultOptions: {
+          queries: { refetchOnWindowFocus: false, retry: 1, staleTime: 60_000 },
+        },
+      }),
+  );
+
   return (
-    <>
+    <QueryClientProvider client={queryClient}>
       <Navbar />
       <Outlet />
       <Toaster position="top-right" richColors />
-    </>
+    </QueryClientProvider>
   );
 }
