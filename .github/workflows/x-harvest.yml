@@ -22,6 +22,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Fail fast with a readable error instead of installing everything and
+      # dying inside harvest.py. Secrets live in Settings > Secrets and
+      # variables > Actions > Repository secrets.
+      - name: Check secrets
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TWITTER_AUTH_TOKEN: ${{ secrets.TWITTER_AUTH_TOKEN }}
+          TWITTER_CT0: ${{ secrets.TWITTER_CT0 }}
+          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+        run: |
+          missing=0
+          for name in SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY; do
+            if [ -z "${!name}" ]; then
+              if [ -n "$DRY_RUN" ]; then
+                echo "::warning::$name is not set (ok for a dry run, nothing gets written)"
+              else
+                echo "::error title=Missing secret::$name is empty. Add it under Settings > Secrets and variables > Actions."
+                missing=1
+              fi
+            fi
+          done
+          if [ -z "$TWITTER_AUTH_TOKEN" ] || [ -z "$TWITTER_CT0" ]; then
+            if [ -z "$EXA_API_KEY" ]; then
+              echo "::warning title=No source configured::set TWITTER_AUTH_TOKEN + TWITTER_CT0, or EXA_API_KEY, otherwise the run finds nothing."
+            else
+              echo "::warning::TWITTER_AUTH_TOKEN / TWITTER_CT0 not set, X search skipped (Exa only)"
+            fi
+          fi
+          exit $missing
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
