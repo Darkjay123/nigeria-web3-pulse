@@ -31,6 +31,10 @@ dist-ssr
 *.sln
 *.sw?
 
+# Python bytecode
+__pycache__/
+*.pyc
+
 # Local env (never commit keys)
 .env
 .env.*
